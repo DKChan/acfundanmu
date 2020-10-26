@@ -1,45 +1,58 @@
 package acfundanmu
 
 import (
-	"log"
 	"sync"
 
 	"github.com/valyala/fastjson"
 )
 
-const visitorSt = "acfun.api.visitor_st"
-const midgroundSt = "acfun.midground.api_st"
-const acfunHost = "https://live.acfun.cn"
-const acfunSignInURL = "https://id.app.acfun.cn/rest/web/login/signin"
-const acfunSafetyIDURL = "https://sec-cdn.gifshow.com/safetyid"
-const liveMainPage = "https://live.acfun.cn/"
-const liveURL = "https://live.acfun.cn/live/"
-const loginURL = "https://id.app.acfun.cn/rest/app/visitor/login"
-const getTokenURL = "https://id.app.acfun.cn/rest/web/token/get"
-const playURL = "https://api.kuaishouzt.com/rest/zt/live/web/startPlay?subBiz=mainApp&kpn=ACFUN_APP&kpf=PC_WEB&userId=%d&did=%s&%s=%s"
-const giftURL = "https://api.kuaishouzt.com/rest/zt/live/web/gift/list?subBiz=mainApp&kpn=ACFUN_APP&kpf=PC_WEB&userId=%d&did=%s&%s=%s"
-const watchingURL = "https://api.kuaishouzt.com/rest/zt/live/web/watchingList?subBiz=mainApp&kpn=ACFUN_APP&kpf=PC_WEB&userId=%d&did=%s&%s=%s"
+const (
+	visitorSt        = "acfun.api.visitor_st"
+	midgroundSt      = "acfun.midground.api_st"
+	acfunSignInURL   = "https://id.app.acfun.cn/rest/web/login/signin"
+	acfunSafetyIDURL = "https://sec-cdn.gifshow.com/safetyid"
+	liveURL          = "https://live.acfun.cn/live/%d"
+	loginURL         = "https://id.app.acfun.cn/rest/app/visitor/login"
+	getTokenURL      = "https://id.app.acfun.cn/rest/web/token/get"
+	playURL          = "https://api.kuaishouzt.com/rest/zt/live/web/startPlay?subBiz=mainApp&kpn=ACFUN_APP&kpf=PC_WEB&userId=%d&did=%s&%s=%s"
+	giftURL          = "https://api.kuaishouzt.com/rest/zt/live/web/gift/list?subBiz=mainApp&kpn=ACFUN_APP&kpf=PC_WEB&userId=%d&did=%s&%s=%s"
 
-const safetyIDContent = "{\"platform\":5,\"app_version\":\"2.0.32\",\"device_id\":\"null\",\"user_id\":\"%d\"}"
+	safetyIDContent = "{\"platform\":5,\"app_version\":\"2.0.32\",\"device_id\":\"null\",\"user_id\":\"%d\"}"
 
-const sid = "sid"
-const visitor = "acfun.api.visitor"
-const midground = "acfun.midground.api"
+	sid       = "sid"
+	visitor   = "acfun.api.visitor"
+	midground = "acfun.midground.api"
 
-const host = "wss://link.xiatou.com/"
-const appID = 13
-const appName = "link-sdk"
-const sdkVersion = "1.2.1"
-const kpn = "ACFUN_APP"
-const kpf = "PC_WEB"
-const subBiz = "mainApp"
-const clientLiveSdkVersion = "kwai-acfun-live-link"
+	host                 = "wss://link.xiatou.com/"
+	appID                = 13
+	appName              = "link-sdk"
+	sdkVersion           = "1.2.1"
+	kpn                  = "ACFUN_APP"
+	kpf                  = "PC_WEB"
+	subBiz               = "mainApp"
+	clientLiveSdkVersion = "kwai-acfun-live-link"
 
-const retryCount uint32 = 1
+	retryCount uint32 = 1
+
+	formContentType = "application/x-www-form-urlencoded"
+)
+
+const (
+	watchingListURL    = "https://api.kuaishouzt.com/rest/zt/live/web/watchingList?subBiz=mainApp&kpn=ACFUN_APP&kpf=PC_WEB&userId=%d&did=%s&%s=%s"
+	endSummaryURL      = "https://api.kuaishouzt.com/rest/zt/live/web/endSummary?subBiz=mainApp&kpn=ACFUN_APP&kpf=PC_WEB&userId=%d&did=%s&%s=%s"
+	redpackLuckListURL = "https://api.kuaishouzt.com/rest/zt/live/web/redpack/getLuckList?subBiz=mainApp&kpn=ACFUN_APP&kpf=PC_WEB&userId=%d&did=%s&%s=%s"
+	getPlayURL         = "https://api.kuaishouzt.com/rest/zt/live/web/getPlayUrls?subBiz=mainApp&kpn=ACFUN_APP&kpf=PC_WEB&userId=%d&did=%s&%s=%s"
+	allGiftURL         = "https://api.kuaishouzt.com/rest/zt/live/web/gift/all?subBiz=mainApp&kpn=ACFUN_APP&kpf=PC_WEB&userId=%d&did=%s&%s=%s"
+	walletBalanceURL   = "https://api.kuaishouzt.com/rest/zt/live/web/pay/wallet/balance?subBiz=mainApp&kpn=ACFUN_APP&kpf=PC_WEB&userId=%d&did=%s&%s=%s"
+	billboardURL       = "https://api.kuaishouzt.com/rest/zt/live/billboard?subBiz=mainApp&kpn=ACFUN_APP&kpf=PC_WEB&userId=%d&did=%s"
+	playbackURL        = "https://api.kuaishouzt.com/rest/zt/live/playBack/startPlay?subBiz=mainApp&kpn=ACFUN_APP&kpf=PC_WEB&userId=%d&did=%s"
+	medalInfoURL       = "https://api-new.app.acfun.cn/rest/app/fansClub/live/medalInfo?uperId=%d"
+	liveListURL        = "https://live.acfun.cn/api/channel/list?count=%d"
+)
 
 type token struct {
-	sync.Mutex      // seqID的锁
-	userID          int64
+	sync.Mutex             // seqID、headerSeqID和ticketIndex的锁
+	userID          int64  // AcFun帐号uid
 	securityKey     string // 第一次发送ws信息时所用密钥
 	serviceToken    string
 	liveID          string
@@ -52,7 +65,10 @@ type token struct {
 	heartbeatSeqID  int64
 	ticketIndex     int
 	deviceID        string
-	gifts           map[int64]Giftdetail
+	gifts           map[int64]GiftDetail
+	uid             int64 // 主播uid
+	livePage        string
+	cookies         []string
 	medalParser     fastjson.ParserPool
 	watchParser     fastjson.ParserPool
 }
@@ -60,12 +76,6 @@ type token struct {
 // 检查错误
 func checkErr(err error) {
 	if err != nil {
-		panicln(err)
+		panic(err)
 	}
-}
-
-// 打印错误然后panic
-func panicln(err error) {
-	log.Println(err)
-	panic(err)
 }
