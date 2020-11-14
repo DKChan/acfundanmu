@@ -7,6 +7,7 @@ import (
 	"encoding/base64"
 	"encoding/binary"
 	"fmt"
+	"log"
 	"math/rand"
 	"strconv"
 	"strings"
@@ -35,14 +36,14 @@ type Summary struct {
 	WatchCount     int   // 观看过直播的人数总数
 }
 
-// MedalDetail 就是登陆帐号守护徽章的详细信息
+// MedalDetail 就是登陆帐号守护徽章的详细信息，没有UserID
 type MedalDetail struct {
 	MedalInfo
 	UperName           string // UP主的名字
 	UperAvatar         string // UP主的头像
 	WearMedal          bool   // 是否正在佩戴该守护徽章
 	FriendshipDegree   int    // 目前守护徽章的亲密度
-	JoinClubTime       int64  // 加入守护团的时间，单位为毫秒
+	JoinClubTime       int64  // 加入守护团的时间，是以纳秒为单位的Unix时间
 	CurrentDegreeLimit int    // 守护徽章目前等级的亲密度的上限
 }
 
@@ -60,6 +61,13 @@ type Playback struct {
 	M3U8Slice string // m3u8
 	Width     int    // 录播视频宽度
 	Height    int    // 录播视频高度
+}
+
+// Manager 就是房管的用户信息，目前没有Medal和ManagerType
+type Manager struct {
+	UserInfo          // 用户信息
+	CustomData string // 用户的一些额外信息，格式为json
+	Online     bool   // 是否直播间在线？
 }
 
 var liveListParser fastjson.ParserPool
@@ -89,26 +97,26 @@ func (t *token) getWatchingList() (watchingList []WatchingUser, e error) {
 	watchingList = make([]WatchingUser, len(watchArray))
 	for i, watch := range watchArray {
 		o := watch.GetObject()
-		w := WatchingUser{}
 		o.Visit(func(k []byte, v *fastjson.Value) {
 			switch string(k) {
 			case "userId":
-				w.UserID = v.GetInt64()
+				watchingList[i].UserID = v.GetInt64()
 			case "nickname":
-				w.Nickname = string(v.GetStringBytes())
+				watchingList[i].Nickname = string(v.GetStringBytes())
 			case "avatar":
-				w.Avatar = string(v.GetStringBytes("0", "url"))
+				watchingList[i].Avatar = string(v.GetStringBytes("0", "url"))
 			case "anonymousUser":
-				w.AnonymousUser = v.GetBool()
+				watchingList[i].AnonymousUser = v.GetBool()
 			case "displaySendAmount":
-				w.DisplaySendAmount = string(v.GetStringBytes())
+				watchingList[i].DisplaySendAmount = string(v.GetStringBytes())
 			case "customWatchingListData":
-				w.CustomData = string(v.GetStringBytes())
+				watchingList[i].CustomData = string(v.GetStringBytes())
 			case "managerType":
-				w.ManagerType = ManagerType(v.GetInt())
+				watchingList[i].ManagerType = ManagerType(v.GetInt())
+			default:
+				log.Printf("在线观众列表里出现未处理的key和value：%s %s", string(k), string(v.MarshalTo([]byte{})))
 			}
 		})
-		watchingList[i] = w
 	}
 
 	return watchingList, nil
@@ -157,29 +165,29 @@ func (t *token) getBillboard() (billboard []BillboardUser, e error) {
 	billboard = make([]BillboardUser, len(billboardArray))
 	for i, user := range billboardArray {
 		o := user.GetObject()
-		b := BillboardUser{}
 		o.Visit(func(k []byte, v *fastjson.Value) {
 			switch string(k) {
 			case "userId":
-				b.UserID = v.GetInt64()
+				billboard[i].UserID = v.GetInt64()
 			case "nickname":
-				b.Nickname = string(v.GetStringBytes())
+				billboard[i].Nickname = string(v.GetStringBytes())
 			case "avatar":
-				b.Avatar = string(v.GetStringBytes("0", "url"))
+				billboard[i].Avatar = string(v.GetStringBytes("0", "url"))
 			case "displaySendAmount":
-				b.DisplaySendAmount = string(v.GetStringBytes())
+				billboard[i].DisplaySendAmount = string(v.GetStringBytes())
 			case "customData":
-				b.CustomData = string(v.GetStringBytes())
+				billboard[i].CustomData = string(v.GetStringBytes())
+			default:
+				log.Printf("礼物贡献榜里出现未处理的key和value：%s %s", string(k), string(v.MarshalTo([]byte{})))
 			}
 		})
-		billboard[i] = b
 	}
 
 	return billboard, nil
 }
 
 // 获取直播总结信息
-func (t *token) getSummary() (summary Summary, e error) {
+func (t *token) getSummary() (summary *Summary, e error) {
 	defer func() {
 		if err := recover(); err != nil {
 			e = fmt.Errorf("getSummary() error: %w", err)
@@ -198,12 +206,22 @@ func (t *token) getSummary() (summary Summary, e error) {
 		panic(fmt.Errorf("获取直播总结信息失败，响应为 %s", string(body)))
 	}
 
-	v = v.Get("data")
-	summary.LiveDurationMs = v.GetInt64("liveDurationMs")
-	summary.LikeCount, err = strconv.Atoi(string(v.GetStringBytes("likeCount")))
-	checkErr(err)
-	summary.WatchCount, err = strconv.Atoi(string(v.GetStringBytes("watchCount")))
-	checkErr(err)
+	summary = &Summary{}
+	o := v.GetObject("data")
+	o.Visit(func(k []byte, v *fastjson.Value) {
+		switch string(k) {
+		case "liveDurationMs":
+			summary.LiveDurationMs = v.GetInt64()
+		case "likeCount":
+			summary.LikeCount, err = strconv.Atoi(string(v.GetStringBytes()))
+			checkErr(err)
+		case "watchCount":
+			summary.WatchCount, err = strconv.Atoi(string(v.GetStringBytes()))
+			checkErr(err)
+		default:
+			log.Printf("直播总结信息里出现未处理的key和value：%s %s", string(k), string(v.MarshalTo([]byte{})))
+		}
+	})
 
 	return summary, nil
 }
@@ -242,22 +260,36 @@ func (t *token) getLuckList(redpack Redpack) (luckyList []LuckyUser, e error) {
 	luckyArray := v.GetArray("data", "luckyList")
 	luckyList = make([]LuckyUser, len(luckyArray))
 	for i, user := range luckyArray {
-		v := user.Get("simpleUserInfo")
-		luckyList[i] = LuckyUser{
-			UserInfo: UserInfo{
-				UserID:   v.GetInt64("userId"),
-				Nickname: string(v.GetStringBytes("nickname")),
-				Avatar:   string(v.GetStringBytes("headPic", "0", "url")),
-			},
-			GrabAmount: user.GetInt("grabAmount"),
-		}
+		o := user.GetObject()
+		o.Visit(func(k []byte, v *fastjson.Value) {
+			switch string(k) {
+			case "simpleUserInfo":
+				o := v.GetObject()
+				o.Visit(func(k []byte, v *fastjson.Value) {
+					switch string(k) {
+					case "userId":
+						luckyList[i].UserID = v.GetInt64()
+					case "nickname":
+						luckyList[i].Nickname = string(v.GetStringBytes())
+					case "headPic":
+						luckyList[i].Avatar = string(v.GetStringBytes("0", "url"))
+					default:
+						log.Printf("抢到红包的用户列表里出现未处理的key和value：%s %s", string(k), string(v.MarshalTo([]byte{})))
+					}
+				})
+			case "grabAmount":
+				luckyList[i].GrabAmount = v.GetInt()
+			default:
+				log.Printf("抢到红包的用户列表里出现未处理的key和value：%s %s", string(k), string(v.MarshalTo([]byte{})))
+			}
+		})
 	}
 
 	return luckyList, nil
 }
 
 // 获取直播回放的相关信息
-func (t *token) getPlayback(liveID string) (playback Playback, e error) {
+func (t *token) getPlayback(liveID string) (playback *Playback, e error) {
 	defer func() {
 		if err := recover(); err != nil {
 			e = fmt.Errorf("getPlayback() error: %w", err)
@@ -300,16 +332,25 @@ func (t *token) getPlayback(liveID string) (playback Playback, e error) {
 	adaptiveManifest := v.GetStringBytes("data", "adaptiveManifest")
 	v, err = p.ParseBytes(adaptiveManifest)
 	checkErr(err)
+	if len(v.GetArray("adaptationSet")) > 1 {
+		log.Println("adaptationSet列表长度大于1，请报告issue")
+	}
 	v = v.Get("adaptationSet", "0")
 	duration := v.GetInt64("duration")
+	if len(v.GetArray("representation")) > 1 {
+		log.Println("representation列表长度大于1，请报告issue")
+	}
 	v = v.Get("representation", "0")
-	playback = Playback{
+	playback = &Playback{
 		Duration:  duration,
 		URL:       string(v.GetStringBytes("url")),
 		BackupURL: string(v.GetStringBytes("backupUrl", "0")),
 		M3U8Slice: string(v.GetStringBytes("m3u8Slice")),
 		Width:     v.GetInt("width"),
 		Height:    v.GetInt("height"),
+	}
+	if len(v.GetArray("backupUrl")) > 1 {
+		log.Println("backupUrl列表长度大于1，请报告issue")
 	}
 
 	return playback, nil
@@ -395,11 +436,100 @@ func (t *token) getWalletBalance() (accoins int, bananas int, e error) {
 		panic(fmt.Errorf("获取拥有的香蕉和钱包里AC币的数量失败，响应为 %s", string(body)))
 	}
 
-	v = v.Get("data", "payWalletTypeToBalance")
-	accoins = v.GetInt("1")
-	bananas = v.GetInt("2")
+	o := v.GetObject("data", "payWalletTypeToBalance")
+	o.Visit(func(k []byte, v *fastjson.Value) {
+		switch string(k) {
+		case "1":
+			accoins = v.GetInt()
+		case "2":
+			bananas = v.GetInt()
+		default:
+			log.Printf("用户钱包里出现未处理的key和value：%s %s", string(k), string(v.MarshalTo([]byte{})))
+		}
+	})
 
 	return accoins, bananas, nil
+}
+
+// 获取主播踢人的历史记录
+func (t *token) getAuthorKickHistory() (e error) {
+	defer func() {
+		if err := recover(); err != nil {
+			e = fmt.Errorf("getAuthorKickHistory() error: %w", err)
+		}
+	}()
+
+	if len(t.cookies) == 0 {
+		panic(fmt.Errorf("获取主播踢人的历史记录需要登陆主播的AcFun帐号"))
+	}
+
+	resp, err := t.fetchKuaiShouAPI(authorKickHistoryURL, nil)
+	checkErr(err)
+	defer fasthttp.ReleaseResponse(resp)
+	body := resp.Body()
+
+	var p fastjson.Parser
+	v, err := p.ParseBytes(body)
+	checkErr(err)
+	if v.GetInt("result") != 1 {
+		panic(fmt.Errorf("获取主播踢人的历史记录失败，响应为 %s", string(body)))
+	} else {
+		log.Printf("获取主播踢人的历史记录的响应为 %s", string(body))
+	}
+
+	return nil
+}
+
+// 获取主播的房管列表
+func (t *token) getAuthorManagerList() (managerList []Manager, e error) {
+	defer func() {
+		if err := recover(); err != nil {
+			e = fmt.Errorf("getAuthorManagerList() error: %w", err)
+		}
+	}()
+
+	if len(t.cookies) == 0 {
+		panic(fmt.Errorf("获取主播的房管列表需要登陆主播的AcFun帐号"))
+	}
+
+	form := fasthttp.AcquireArgs()
+	defer fasthttp.ReleaseArgs(form)
+	form.Set("visitorId", strconv.FormatInt(t.userID, 10))
+	resp, err := t.fetchKuaiShouAPI(authorManagerListURL, form)
+	checkErr(err)
+	defer fasthttp.ReleaseResponse(resp)
+	body := resp.Body()
+
+	var p fastjson.Parser
+	v, err := p.ParseBytes(body)
+	checkErr(err)
+	if v.GetInt("result") != 1 {
+		panic(fmt.Errorf("获取主播的房管列表失败，响应为 %s", string(body)))
+	}
+
+	list := v.GetArray("data", "list")
+	managerList = make([]Manager, len(list))
+	for i, m := range list {
+		o := m.GetObject()
+		o.Visit(func(k []byte, v *fastjson.Value) {
+			switch string(k) {
+			case "userId":
+				managerList[i].UserID = v.GetInt64()
+			case "nickname":
+				managerList[i].Nickname = string(v.GetStringBytes())
+			case "avatar":
+				managerList[i].Avatar = string(v.GetStringBytes("0", "url"))
+			case "customData":
+				managerList[i].CustomData = string(v.GetStringBytes())
+			case "online":
+				managerList[i].Online = v.GetBool()
+			default:
+				log.Printf("主播的房管列表里出现未处理的key和value：%s %s", string(k), string(v.MarshalTo([]byte{})))
+			}
+		})
+	}
+
+	return managerList, nil
 }
 
 // 生成client sign
@@ -458,13 +588,13 @@ func getMedalInfo(uid int64, cookies []string) (medalList []MedalDetail, clubNam
 		}
 	}()
 
-	var httpCookies []*fasthttp.Cookie
-	for _, c := range cookies {
+	httpCookies := make([]*fasthttp.Cookie, len(cookies))
+	for i, c := range cookies {
 		cookie := fasthttp.AcquireCookie()
 		defer fasthttp.ReleaseCookie(cookie)
 		err := cookie.Parse(c)
 		checkErr(err)
-		httpCookies = append(httpCookies, cookie)
+		httpCookies[i] = cookie
 	}
 	client := &httpClient{
 		url:     fmt.Sprintf(medalInfoURL, uid),
@@ -488,19 +618,31 @@ func getMedalInfo(uid int64, cookies []string) (medalList []MedalDetail, clubNam
 	medalArray := v.GetArray("medalList")
 	medalList = make([]MedalDetail, len(medalArray))
 	for i, medal := range medalArray {
-		medalList[i] = MedalDetail{
-			MedalInfo: MedalInfo{
-				UperID:   medal.GetInt64("uperId"),
-				ClubName: string(medal.GetStringBytes("clubName")),
-				Level:    medal.GetInt("level"),
-			},
-			UperName:           string(medal.GetStringBytes("uperName")),
-			UperAvatar:         string(medal.GetStringBytes("uperHeadUrl")),
-			WearMedal:          medal.GetBool("wearMedal"),
-			FriendshipDegree:   medal.GetInt("friendshipDegree"),
-			JoinClubTime:       medal.GetInt64("joinClubTime"),
-			CurrentDegreeLimit: medal.GetInt("currentDegreeLimit"),
-		}
+		o := medal.GetObject()
+		o.Visit(func(k []byte, v *fastjson.Value) {
+			switch string(k) {
+			case "uperId":
+				medalList[i].UperID = v.GetInt64()
+			case "clubName":
+				medalList[i].ClubName = string(v.GetStringBytes())
+			case "level":
+				medalList[i].Level = v.GetInt()
+			case "uperName":
+				medalList[i].UperName = string(v.GetStringBytes())
+			case "uperHeadUrl":
+				medalList[i].UperAvatar = string(v.GetStringBytes())
+			case "wearMedal":
+				medalList[i].WearMedal = v.GetBool()
+			case "friendshipDegree":
+				medalList[i].FriendshipDegree = v.GetInt()
+			case "joinClubTime":
+				medalList[i].JoinClubTime = v.GetInt64() * 1e6
+			case "currentDegreeLimit":
+				medalList[i].CurrentDegreeLimit = v.GetInt()
+			default:
+				log.Printf("登陆帐号的守护徽章里出现未处理的key和value：%s %s", string(k), string(v.MarshalTo([]byte{})))
+			}
+		})
 	}
 
 	return medalList, clubName, nil
@@ -550,6 +692,7 @@ func (pb *Playback) Distinguish() (aliURL, txURL string) {
 	case strings.Contains(pb.URL, "txvod"):
 		txURL = pb.URL
 	default:
+		log.Printf("未能识别的录播链接：%s", pb.URL)
 	}
 
 	switch {
@@ -558,6 +701,7 @@ func (pb *Playback) Distinguish() (aliURL, txURL string) {
 	case strings.Contains(pb.BackupURL, "txvod"):
 		txURL = pb.BackupURL
 	default:
+		log.Printf("未能识别的录播链接：%s", pb.BackupURL)
 	}
 
 	return aliURL, txURL
@@ -574,7 +718,7 @@ func (dq *DanmuQueue) GetBillboard() ([]BillboardUser, error) {
 }
 
 // GetSummary 返回直播总结信息，不需要调用StartDanmu()
-func (dq *DanmuQueue) GetSummary() (Summary, error) {
+func (dq *DanmuQueue) GetSummary() (*Summary, error) {
 	return dq.t.getSummary()
 }
 
@@ -584,8 +728,17 @@ func (dq *DanmuQueue) GetLuckList(redpack Redpack) ([]LuckyUser, error) {
 }
 
 // GetPlayback 返回直播回放的相关信息，需要liveID，可以调用Init(0, nil)，不需要调用StartDanmu()，目前部分直播没有回放
-func (dq *DanmuQueue) GetPlayback(liveID string) (Playback, error) {
+func (dq *DanmuQueue) GetPlayback(liveID string) (*Playback, error) {
 	return dq.t.getPlayback(liveID)
+}
+
+// GetGiftList 返回指定主播直播间的礼物数据，不需要调用StartDanmu()
+func (dq *DanmuQueue) GetGiftList() map[int64]GiftDetail {
+	gifts := make(map[int64]GiftDetail)
+	for k, v := range dq.t.gifts {
+		gifts[k] = v
+	}
+	return gifts
 }
 
 // GetAllGift 返回全部礼物的数据，可以调用Init(0, nil)，不需要调用StartDanmu()
@@ -596,6 +749,16 @@ func (dq *DanmuQueue) GetAllGift() (map[int64]GiftDetail, error) {
 // GetWalletBalance 返回钱包里AC币和拥有的香蕉的数量，需要调用Login()登陆AcFun帐号，可以调用Init(0, cookies)，不需要调用StartDanmu()
 func (dq *DanmuQueue) GetWalletBalance() (accoins int, bananas int, e error) {
 	return dq.t.getWalletBalance()
+}
+
+// GetAuthorKickHistory 返回主播踢人的历史记录，需要调用Login()登陆主播的AcFun帐号，不需要调用StartDanmu()，未测试
+func (dq *DanmuQueue) GetAuthorKickHistory() (e error) {
+	return dq.t.getAuthorKickHistory()
+}
+
+// GetAuthorManagerList 返回主播的房管列表，需要调用Login()登陆主播的AcFun帐号，可以调用Init(0, cookies)，不需要调用StartDanmu()
+func (dq *DanmuQueue) GetAuthorManagerList() ([]Manager, error) {
+	return dq.t.getAuthorManagerList()
 }
 
 // GetMedalInfo 返回登陆用户的守护徽章列表medalList和uid指定主播的守护徽章的名字clubName，利用Login()获取AcFun帐号的cookies

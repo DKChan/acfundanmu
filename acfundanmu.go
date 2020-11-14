@@ -95,6 +95,7 @@ type GiftDetail struct {
 	SmallPngPic            string // 礼物的png格式图片（小）
 	AllowBatchSendSizeList []int  // 网页或APP单次能够赠送的礼物数量列表
 	CanCombo               bool   // 是否能连击，一般免费礼物（香蕉）不能连击，其余能连击
+	CanDraw                bool   // 是否能涂鸦？
 	MagicFaceID            int
 	Description            string // 礼物的描述
 	RedpackPrice           int    // 礼物红包价格总额，单位为AC币
@@ -127,6 +128,7 @@ type UserInfo struct {
 // MedalInfo 就是守护徽章信息
 type MedalInfo struct {
 	UperID   int64  // UP主的uid
+	UserID   int64  // 用户的uid
 	ClubName string // 守护徽章名字
 	Level    int    // 守护徽章等级
 }
@@ -157,8 +159,8 @@ type RichTextImage struct {
 
 // DanmuMessage 弹幕的接口
 type DanmuMessage interface {
-	GetSendTime() int64    // 获取弹幕发送时间
-	GetUserInfo() UserInfo // 获取UserInfo
+	GetSendTime() int64     // 获取弹幕发送时间
+	GetUserInfo() *UserInfo // 获取UserInfo
 }
 
 // DanmuCommon 弹幕通用部分
@@ -322,7 +324,7 @@ type liveInfo struct {
 	StreamInfo
 }
 
-// DanmuQueue 就是直播间弹幕系统相关信息
+// DanmuQueue 就是直播间弹幕系统相关信息，支持并行
 type DanmuQueue struct {
 	q          *queue.Queue // DanmuMessage的队列
 	info       *liveInfo    // 直播间的相关信息状态
@@ -374,7 +376,7 @@ func Init(uid int64, cookies []string) (dq *DanmuQueue, err error) {
 		dq.info.StreamInfo, err = dq.t.getToken()
 		if err != nil {
 			if retry == 2 {
-				log.Printf("初始化失败，停止获取弹幕：%v", err)
+				log.Printf("初始化失败：%v", err)
 				return nil, fmt.Errorf("Init() error: 初始化失败，主播可能不在直播：%w", err)
 			}
 			log.Printf("初始化出现错误：%v", err)
@@ -418,7 +420,7 @@ func InitWithToken(uid int64, tokenInfo TokenInfo) (dq *DanmuQueue, err error) {
 		dq.info.StreamInfo, err = dq.t.getLiveToken()
 		if err != nil {
 			if retry == 2 {
-				log.Printf("初始化失败，停止获取弹幕：%v", err)
+				log.Printf("初始化失败：%v", err)
 				return nil, fmt.Errorf("InitWithToken() error: 初始化失败，主播可能不在直播：%w", err)
 			}
 			log.Printf("初始化出现错误：%v", err)
@@ -435,7 +437,7 @@ func InitWithToken(uid int64, tokenInfo TokenInfo) (dq *DanmuQueue, err error) {
 // ReInit 利用已有的 *DanmuQueue 重新初始化，返回新的 *DanmuQueue，事件模式下clearHandlers为true时需要重新调用OnComment等函数
 func (dq *DanmuQueue) ReInit(uid int64, clearHandlers bool) (newDQ *DanmuQueue, err error) {
 	tokenInfo := dq.GetTokenInfo()
-	newDQ, err = InitWithToken(uid, tokenInfo)
+	newDQ, err = InitWithToken(uid, *tokenInfo)
 	if err != nil {
 		return nil, err
 	}
@@ -491,28 +493,28 @@ func (dq *DanmuQueue) GetDanmu() (danmu []DanmuMessage) {
 }
 
 // GetLiveInfo 返回直播间的状态信息，需要先调用StartDanmu(ctx, false)
-func (dq *DanmuQueue) GetLiveInfo() (info LiveInfo) {
+func (dq *DanmuQueue) GetLiveInfo() *LiveInfo {
 	dq.info.Lock()
 	defer dq.info.Unlock()
-	info = dq.info.LiveInfo
+	info := dq.info.LiveInfo
 	info.TopUsers = append([]TopUser{}, dq.info.TopUsers...)
 	info.RecentComment = append([]Comment{}, dq.info.RecentComment...)
 	info.RedpackList = append([]Redpack{}, dq.info.RedpackList...)
-	return info
+	return &info
 }
 
 // GetTokenInfo 返回直播间token相关信息，不需要调用StartDanmu()
-func (dq *DanmuQueue) GetTokenInfo() (info TokenInfo) {
-	info = dq.info.TokenInfo
+func (dq *DanmuQueue) GetTokenInfo() *TokenInfo {
+	info := dq.info.TokenInfo
 	info.Cookies = append([]string{}, dq.info.Cookies...)
-	return info
+	return &info
 }
 
 // GetStreamInfo 返回直播的一些信息，不需要调用StartDanmu()
-func (dq *DanmuQueue) GetStreamInfo() (info StreamInfo) {
-	info = dq.info.StreamInfo
+func (dq *DanmuQueue) GetStreamInfo() *StreamInfo {
+	info := dq.info.StreamInfo
 	info.StreamList = append([]StreamURL{}, dq.info.StreamList...)
-	return info
+	return &info
 }
 
 // GetUID 返回主播的uid，有可能是0
@@ -521,10 +523,10 @@ func (dq *DanmuQueue) GetUID() int64 {
 }
 
 // GetTokenInfo 返回TokenInfo，相当于调用 Init(0, cookies) 后返回对应的TokenInfo，cookies可以利用Login()获取，为nil时为游客模式
-func GetTokenInfo(cookies []string) (TokenInfo, error) {
+func GetTokenInfo(cookies []string) (*TokenInfo, error) {
 	dq, err := Init(0, cookies)
 	if err != nil {
-		return TokenInfo{}, err
+		return nil, err
 	}
 	return dq.GetTokenInfo(), nil
 }
