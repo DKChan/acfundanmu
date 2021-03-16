@@ -1,21 +1,21 @@
 # acfundanmu
-[![PkgGoDev](https://pkg.go.dev/badge/github.com/orzogc/acfundanmu)](https://pkg.go.dev/github.com/orzogc/acfundanmu)
+[![GoDoc](https://godoc.org/github.com/orzogc/acfundanmu?status.png)](https://godoc.org/github.com/orzogc/acfundanmu) [![PkgGoDev](https://pkg.go.dev/badge/github.com/orzogc/acfundanmu)](https://pkg.go.dev/github.com/orzogc/acfundanmu)
 
 AcFun直播API，弹幕实现参照 [AcFunDanmaku](https://github.com/wpscott/AcFunDanmaku/tree/master/AcFunDanmu)
 
 ### 示例代码
-#### 获取弹幕（非事件响应模式）
+#### 获取弹幕（非事件模式）
 ```go
 // uid为主播的uid
-ac, err := acfundanmu.NewAcFunLive(acfundanmu.SetLiverUID(uid))
+dq, err := acfundanmu.Init(uid, nil)
 if err != nil {
     log.Panicln(err)
 }
 ctx, cancel := context.WithCancel(context.Background())
 defer cancel()
-ch := ac.StartDanmu(ctx, false)
+ch := dq.StartDanmu(ctx, false)
 for {
-    if danmu := ac.GetDanmu(); danmu != nil {
+    if danmu := dq.GetDanmu(); danmu != nil {
         for _, d := range danmu {
             switch d := d.(type) {
             case *acfundanmu.Comment:
@@ -54,60 +54,59 @@ for {
         } else {
             log.Println("直播结束")
         }
-        break
     }
 }
 ```
-#### 采用事件响应模式
+#### 采用事件模式
 ```go
 // uid为主播的uid
-ac, err := acfundanmu.NewAcFunLive(acfundanmu.SetLiverUID(uid))
+dq, err := acfundanmu.Init(uid, nil)
 if err != nil {
     log.Panicln(err)
 }
-ac.OnDanmuStop(func(ac *acfundanmu.AcFunLive, err error) {
+dq.OnLiveOff(func(dq *acfundanmu.DanmuQueue, err error) {
     if err != nil {
         log.Println(err)
     } else {
         log.Println("直播结束")
     }
 })
-ac.OnComment(func(ac *acfundanmu.AcFunLive, d *acfundanmu.Comment) {
+dq.OnComment(func(dq *acfundanmu.DanmuQueue, d *acfundanmu.Comment) {
     log.Printf("%s（%d）：%s\n", d.Nickname, d.UserID, d.Content)
 })
-ac.OnLike(func(ac *acfundanmu.AcFunLive, d *acfundanmu.Like) {
+dq.OnLike(func(dq *acfundanmu.DanmuQueue, d *acfundanmu.Like) {
     log.Printf("%s（%d）点赞\n", d.Nickname, d.UserID)
 })
-ac.OnEnterRoom(func(ac *acfundanmu.AcFunLive, d *acfundanmu.EnterRoom) {
+dq.OnEnterRoom(func(dq *acfundanmu.DanmuQueue, d *acfundanmu.EnterRoom) {
     log.Printf("%s（%d）进入直播间\n", d.Nickname, d.UserID)
 })
-ac.OnFollowAuthor(func(ac *acfundanmu.AcFunLive, d *acfundanmu.FollowAuthor) {
+dq.OnFollowAuthor(func(dq *acfundanmu.DanmuQueue, d *acfundanmu.FollowAuthor) {
     log.Printf("%s（%d）关注了主播\n", d.Nickname, d.UserID)
 })
-ac.OnThrowBanana(func(ac *acfundanmu.AcFunLive, d *acfundanmu.ThrowBanana) {
+dq.OnThrowBanana(func(dq *acfundanmu.DanmuQueue, d *acfundanmu.ThrowBanana) {
     log.Printf("%s（%d）送出香蕉 * %d\n", d.Nickname, d.UserID, d.BananaCount)
 })
-ac.OnGift(func(ac *acfundanmu.AcFunLive, d *acfundanmu.Gift) {
+dq.OnGift(func(dq *acfundanmu.DanmuQueue, d *acfundanmu.Gift) {
     log.Printf("%s（%d）送出礼物 %s * %d，连击数：%d\n", d.Nickname, d.UserID, d.GiftName, d.Count, d.Combo)
 })
-ac.OnJoinClub(func(ac *acfundanmu.AcFunLive, d *acfundanmu.JoinClub) {
+dq.OnJoinClub(func(dq *acfundanmu.DanmuQueue, d *acfundanmu.JoinClub) {
     log.Printf("%s（%d）加入主播%s（%d）的守护团", d.FansInfo.Nickname, d.FansInfo.UserID, d.UperInfo.Nickname, d.UperInfo.UserID)
 })
 ctx, cancel := context.WithCancel(context.Background())
 defer cancel()
-_ = ac.StartDanmu(ctx, true)
+_ = dq.StartDanmu(ctx, true)
 // 做其他事情
 ```
 #### 获取直播间状态信息（非事件模式）
 ```go
 // uid为主播的uid
-ac, err := acfundanmu.NewAcFunLive(acfundanmu.SetLiverUID(uid))
+dq, err := acfundanmu.Init(uid, nil)
 if err != nil {
     log.Panicln(err)
 }
 ctx, cancel := context.WithCancel(context.Background())
 defer cancel()
-ch := ac.StartDanmu(ctx, false)
+ch := dq.StartDanmu(ctx, false)
 for {
     select {
     case <-ctx.Done():
@@ -115,7 +114,7 @@ for {
     default:
         // 循环获取info并处理
         time.Sleep(5 * time.Second)
-        info := ac.GetLiveInfo()
+        info := dq.GetLiveInfo()
         log.Printf("%+v\n", info)
     }
 }
@@ -128,7 +127,7 @@ if err = <-ch; err != nil {
 #### 获取直播间排名前50的在线观众信息列表
 ```go
 // uid为主播的uid
-ac, err := acfundanmu.NewAcFunLive(acfundanmu.SetLiverUID(uid))
+dq, err := acfundanmu.Init(uid, nil)
 if err != nil {
     log.Panicln(err)
 }
@@ -141,7 +140,7 @@ go func() {
             return
         default:
             // 循环获取watchingList并处理
-            watchingList, err := ac.GetWatchingList()
+            watchingList, err := dq.GetWatchingList()
             if err != nil {
                 log.Panicln(err)
             }
@@ -155,14 +154,14 @@ go func() {
 #### 将弹幕转换成ass字幕文件
 ```go
 // uid为主播的uid
-ac, err := acfundanmu.NewAcFunLive(acfundanmu.SetLiverUID(uid))
+dq, err := acfundanmu.Init(uid, nil)
 if err != nil {
     log.Panicln(err)
 }
 ctx, cancel := context.WithCancel(context.Background())
 defer cancel()
-ch := ac.StartDanmu(ctx, false)
-ac.WriteASS(ctx, acfundanmu.SubConfig{
+ch := dq.StartDanmu(ctx, false)
+dq.WriteASS(ctx, acfundanmu.SubConfig{
     Title:     "foo",
     PlayResX:  1280, // 直播录播视频的分辨率
     PlayResY:  720,
