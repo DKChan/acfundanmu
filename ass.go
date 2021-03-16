@@ -14,8 +14,6 @@ import (
 
 // ass文件的Script Info
 const scriptInfo = `[Script Info]
-; LiveID: %s
-; StreamName: %s
 Title: %s
 ScriptType: v4.00+
 Collisions: Normal
@@ -51,11 +49,11 @@ type danmuTime int64
 
 // SubConfig 是字幕的详细设置
 type SubConfig struct {
-	Title     string `json:"title"`     // 字幕标题
-	PlayResX  int    `json:"playResX"`  // 视频分辨率
-	PlayResY  int    `json:"playResY"`  // 视频分辨率
-	FontSize  int    `json:"fontSize"`  // 字体大小
-	StartTime int64  `json:"startTime"` // 直播录播开始的时间，是以纳秒为单位的Unix时间
+	Title     string // 字幕标题
+	PlayResX  int    // 视频分辨率
+	PlayResY  int    // 视频分辨率
+	FontSize  int    // 字体大小
+	StartTime int64  // 直播录播开始的时间，是以纳秒为单位的Unix时间
 }
 
 // dTime就是计算弹幕碰撞需要的数据
@@ -87,7 +85,7 @@ func convert(name string) string {
 
 // WriteASS 将ass字幕写入到file里，s为字幕的设置，ctx用来结束写入ass字幕，需要先调用StartDanmu(ctx, false)。
 // newFile为true时覆盖写入，为false时不覆盖写入且只写入Dialogue字幕。
-func (ac *AcFunLive) WriteASS(ctx context.Context, s SubConfig, file string, newFile bool) {
+func (dq *DanmuQueue) WriteASS(ctx context.Context, s SubConfig, file string, newFile bool) {
 	defer func() {
 		if err := recover(); err != nil {
 			log.Printf("Recovering from panic in WriteASS(), the error is: %v", err)
@@ -95,15 +93,15 @@ func (ac *AcFunLive) WriteASS(ctx context.Context, s SubConfig, file string, new
 		}
 	}()
 
-	if ac.q == nil {
+	if dq.q == nil {
 		log.Println("需要先调用StartDanmu()，event不能为true")
 		return
 	}
-	if ac.t.liverUID == 0 {
+	if dq.t.uid == 0 {
 		log.Println("主播uid不能为0")
 		return
 	}
-	if (*queue.Queue)(ac.q).Disposed() {
+	if (*queue.Queue)(dq.q).Disposed() {
 		return
 	}
 
@@ -114,7 +112,7 @@ func (ac *AcFunLive) WriteASS(ctx context.Context, s SubConfig, file string, new
 		checkErr(err)
 		defer f.Close()
 
-		info := fmt.Sprintf(scriptInfo, ac.info.LiveID, ac.info.StreamName, s.Title, s.PlayResX, s.PlayResY)
+		info := fmt.Sprintf(scriptInfo, s.Title, s.PlayResX, s.PlayResY)
 		style := fmt.Sprintf(sytles, s.FontSize)
 
 		_, err = f.WriteString(info)
@@ -136,7 +134,7 @@ func (ac *AcFunLive) WriteASS(ctx context.Context, s SubConfig, file string, new
 		case <-ctx.Done():
 			return
 		default:
-			danmu := ac.GetDanmu()
+			danmu := dq.GetDanmu()
 			if danmu == nil {
 				return
 			}
@@ -148,13 +146,12 @@ func (ac *AcFunLive) WriteASS(ctx context.Context, s SubConfig, file string, new
 				}
 
 				length := utf8.RuneCountInString(c.Content) * s.FontSize
-				sendTime := c.SendTime * 1e6
 				// leftTime就是弹幕运动到视频左边的时间
-				leftTime := sendTime - s.StartTime + (int64(s.PlayResX)*duration)/int64(s.PlayResX+length)
+				leftTime := c.SendTime - s.StartTime + (int64(s.PlayResX)*duration)/int64(s.PlayResX+length)
 				dt := dTime{
-					appear:    sendTime - s.StartTime,
-					emerge:    sendTime - s.StartTime + (int64(length)*duration)/int64(s.PlayResX+length),
-					disappear: sendTime - s.StartTime + duration}
+					appear:    c.SendTime - s.StartTime,
+					emerge:    c.SendTime - s.StartTime + (int64(length)*duration)/int64(s.PlayResX+length),
+					disappear: c.SendTime - s.StartTime + duration}
 				for i, t := range lastTime {
 					// 防止弹幕发生碰撞重叠
 					if dt.appear > t.emerge && leftTime > t.disappear {

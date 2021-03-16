@@ -4,13 +4,84 @@ import (
 	"fmt"
 	"log"
 	"strconv"
+	"time"
 
 	"github.com/valyala/fasthttp"
 	"github.com/valyala/fastjson"
 )
 
+type httpClient struct {
+	client      *fasthttp.Client
+	url         string
+	body        []byte
+	method      string
+	cookies     []*fasthttp.Cookie
+	contentType string
+	referer     string
+}
+
+var defaultClient = &fasthttp.Client{
+	MaxIdleConnDuration: 90 * time.Second,
+	ReadTimeout:         10 * time.Second,
+	WriteTimeout:        10 * time.Second,
+}
+
+// http请求，调用后需要 defer fasthttp.ReleaseResponse(resp)
+func (c *httpClient) doRequest() (resp *fasthttp.Response, e error) {
+	defer func() {
+		if err := recover(); err != nil {
+			e = fmt.Errorf("doRequest() error: %w", err)
+			fasthttp.ReleaseResponse(resp)
+		}
+	}()
+
+	req := fasthttp.AcquireRequest()
+	defer fasthttp.ReleaseRequest(req)
+	resp = fasthttp.AcquireResponse()
+
+	if c.client == nil {
+		c.client = defaultClient
+	}
+
+	if c.url != "" {
+		req.SetRequestURI(c.url)
+	} else {
+		panic(fmt.Errorf("请求的url不能为空"))
+	}
+
+	if len(c.body) != 0 {
+		req.SetBody(c.body)
+	}
+
+	if c.method != "" {
+		req.Header.SetMethod(c.method)
+	} else {
+		// 默认为GET
+		req.Header.SetMethod("GET")
+	}
+
+	if len(c.cookies) != 0 {
+		for _, cookie := range c.cookies {
+			req.Header.SetCookieBytesKV(cookie.Key(), cookie.Value())
+		}
+	}
+
+	if c.contentType != "" {
+		req.Header.SetContentType(c.contentType)
+	}
+
+	if c.referer != "" {
+		req.Header.SetReferer(c.referer)
+	}
+
+	err := c.client.Do(req, resp)
+	checkErr(err)
+
+	return resp, nil
+}
+
 // 登陆acfun账号
-func login(account, password string) (cookies Cookies, e error) {
+func login(username, password string) (cookies []string, e error) {
 	defer func() {
 		if err := recover(); err != nil {
 			cookies = nil
@@ -18,13 +89,13 @@ func login(account, password string) (cookies Cookies, e error) {
 		}
 	}()
 
-	if account == "" || password == "" {
+	if username == "" || password == "" {
 		panic(fmt.Errorf("AcFun帐号邮箱或密码为空，无法登陆"))
 	}
 
 	form := fasthttp.AcquireArgs()
 	defer fasthttp.ReleaseArgs(form)
-	form.Set("username", account)
+	form.Set("username", username)
 	form.Set("password", password)
 	form.Set("key", "")
 	form.Set("captcha", "")
@@ -35,16 +106,46 @@ func login(account, password string) (cookies Cookies, e error) {
 		method:      "POST",
 		contentType: formContentType,
 	}
-	body, cookies, err := client.getCookies()
+	resp, err := client.doRequest()
 	checkErr(err)
+	defer fasthttp.ReleaseResponse(resp)
+	body := resp.Body()
 
-	p := generalParserPool.Get()
-	defer generalParserPool.Put(p)
+	var p fastjson.Parser
 	v, err := p.ParseBytes(body)
 	checkErr(err)
 	if !v.Exists("result") || v.GetInt("result") != 0 {
 		panic(fmt.Errorf("以注册用户的身份登陆AcFun失败，响应为 %s", string(body)))
 	}
+
+	resp.Header.VisitAllCookie(func(key, value []byte) {
+		cookies = append(cookies, string(value))
+	})
+
+	userID := v.GetInt("userId")
+	content := fmt.Sprintf(safetyIDContent, userID)
+	client = &httpClient{
+		url:    acfunSafetyIDURL,
+		body:   []byte(content),
+		method: "POST",
+	}
+	resp, err = client.doRequest()
+	checkErr(err)
+	defer fasthttp.ReleaseResponse(resp)
+	body = resp.Body()
+
+	v, err = p.ParseBytes(body)
+	checkErr(err)
+	if !v.Exists("code") || v.GetInt("code") != 0 {
+		panic(fmt.Errorf("获取safetyid失败，响应为 %s", string(body)))
+	}
+
+	cookie := fasthttp.AcquireCookie()
+	defer fasthttp.ReleaseCookie(cookie)
+	cookie.SetKey("safety_id")
+	cookie.SetValueBytes(v.GetStringBytes("safety_id"))
+	cookie.SetDomain(".acfun.cn")
+	cookies = append(cookies, cookie.String())
 
 	return cookies, nil
 }
@@ -57,40 +158,56 @@ func (t *token) getAcFunToken() (e error) {
 		}
 	}()
 
-	err := t.getDeviceID()
+	client := &httpClient{
+		url:    t.livePage,
+		method: "GET",
+	}
+	resp, err := client.doRequest()
 	checkErr(err)
+	defer fasthttp.ReleaseResponse(resp)
+
+	// 获取did（device ID）
+	didCookie := fasthttp.AcquireCookie()
+	defer fasthttp.ReleaseCookie(didCookie)
+	didCookie.SetKey("_did")
+	if !resp.Header.Cookie(didCookie) {
+		panic("无法获取didCookie")
+	}
+	deviceID := string(didCookie.Value())
 
 	form := fasthttp.AcquireArgs()
 	defer fasthttp.ReleaseArgs(form)
-	var client *httpClient
-	if len(t.Cookies) != 0 {
+	if len(t.cookies) != 0 {
 		form.Set(sid, midground)
+		cookies := make([]*fasthttp.Cookie, len(t.cookies))
+		for i, c := range t.cookies {
+			cookie := fasthttp.AcquireCookie()
+			defer fasthttp.ReleaseCookie(cookie)
+			err = cookie.Parse(c)
+			checkErr(err)
+			cookies[i] = cookie
+		}
 		client = &httpClient{
 			url:     getTokenURL,
 			body:    form.QueryString(),
-			cookies: t.Cookies,
-			referer: t.livePage,
+			cookies: cookies,
 		}
 	} else {
 		form.Set(sid, visitor)
-		cookie := fasthttp.AcquireCookie()
-		defer fasthttp.ReleaseCookie(cookie)
-		cookie.SetKey("_did")
-		cookie.SetValue(t.DeviceID)
 		client = &httpClient{
 			url:     loginURL,
 			body:    form.QueryString(),
-			cookies: []*fasthttp.Cookie{cookie},
-			referer: t.livePage,
+			cookies: []*fasthttp.Cookie{didCookie},
 		}
 	}
 	client.method = "POST"
 	client.contentType = formContentType
-	body, err := client.request()
+	resp, err = client.doRequest()
 	checkErr(err)
+	defer fasthttp.ReleaseResponse(resp)
+	body := resp.Body()
 
-	p := generalParserPool.Get()
-	defer generalParserPool.Put(p)
+	var p fastjson.Parser
 	v, err := p.ParseBytes(body)
 	checkErr(err)
 	if !v.Exists("result") || v.GetInt("result") != 0 {
@@ -100,7 +217,7 @@ func (t *token) getAcFunToken() (e error) {
 	// 获取userId和对应的令牌
 	userID := v.GetInt64("userId")
 	var serviceToken, securityKey string
-	if len(t.Cookies) != 0 {
+	if len(t.cookies) != 0 {
 		securityKey = string(v.GetStringBytes("ssecurity"))
 		serviceToken = string(v.GetStringBytes(midgroundSt))
 	} else {
@@ -108,9 +225,10 @@ func (t *token) getAcFunToken() (e error) {
 		serviceToken = string(v.GetStringBytes(visitorSt))
 	}
 
-	t.UserID = userID
-	t.SecurityKey = securityKey
-	t.ServiceToken = serviceToken
+	t.userID = userID
+	t.securityKey = securityKey
+	t.serviceToken = serviceToken
+	t.deviceID = deviceID
 
 	return nil
 }
@@ -123,22 +241,22 @@ func (t *token) getLiveToken() (stream StreamInfo, e error) {
 		}
 	}()
 
-	if t.liverUID == 0 {
+	if t.uid == 0 {
 		return stream, nil
 	}
 
 	var play string
-	if len(t.Cookies) != 0 {
+	if len(t.cookies) != 0 {
 		// 需要userId、deviceID和serviceToken
-		play = fmt.Sprintf(playURL, t.UserID, t.DeviceID, midgroundSt, t.ServiceToken)
+		play = fmt.Sprintf(playURL, t.userID, t.deviceID, midgroundSt, t.serviceToken)
 	} else {
-		play = fmt.Sprintf(playURL, t.UserID, t.DeviceID, visitorSt, t.ServiceToken)
+		play = fmt.Sprintf(playURL, t.userID, t.deviceID, visitorSt, t.serviceToken)
 	}
 
 	form := fasthttp.AcquireArgs()
 	defer fasthttp.ReleaseArgs(form)
 	// authorId就是主播的uid
-	form.Set("authorId", strconv.FormatInt(t.liverUID, 10))
+	form.Set("authorId", strconv.FormatInt(t.uid, 10))
 	form.Set("pullStreamType", "FLV")
 	client := &httpClient{
 		url:         play,
@@ -147,11 +265,12 @@ func (t *token) getLiveToken() (stream StreamInfo, e error) {
 		contentType: formContentType,
 		referer:     t.livePage, // 会验证 Referer
 	}
-	body, err := client.request()
+	resp, err := client.doRequest()
 	checkErr(err)
+	defer fasthttp.ReleaseResponse(resp)
+	body := resp.Body()
 
-	p := generalParserPool.Get()
-	defer generalParserPool.Put(p)
+	var p fastjson.Parser
 	v, err := p.ParseBytes(body)
 	checkErr(err)
 	if v.GetInt("result") != 1 {
@@ -171,10 +290,10 @@ func (t *token) getLiveToken() (stream StreamInfo, e error) {
 	t.enterRoomAttach = enterRoomAttach
 	t.tickets = tickets
 	t.instanceID = 0
-	t.sessionKey = nil
+	t.sessionKey = ""
 	t.seqID = 1
 	t.headerSeqID = 1
-	t.heartbeatSeqID = 0
+	t.heartbeatSeqID = 1
 	t.ticketIndex = 0
 
 	err = t.getGiftList()
@@ -220,33 +339,6 @@ func (t *token) getToken() (stream StreamInfo, e error) {
 	return stream, nil
 }
 
-// 获取deviceID
-func (t *token) getDeviceID() (e error) {
-	defer func() {
-		if err := recover(); err != nil {
-			e = fmt.Errorf("getDeviceID() error: %w", err)
-		}
-	}()
-
-	client := &httpClient{
-		url:    t.livePage,
-		method: "GET",
-	}
-	resp, err := client.doRequest()
-	checkErr(err)
-	defer fasthttp.ReleaseResponse(resp)
-
-	didCookie := fasthttp.AcquireCookie()
-	defer fasthttp.ReleaseCookie(didCookie)
-	didCookie.SetKey("_did")
-	if !resp.Header.Cookie(didCookie) {
-		panic("无法获取didCookie")
-	}
-	t.DeviceID = string(didCookie.Value())
-
-	return nil
-}
-
 // 获取礼物列表
 func (t *token) getGiftList() (e error) {
 	defer func() {
@@ -255,11 +347,12 @@ func (t *token) getGiftList() (e error) {
 		}
 	}()
 
-	body, err := t.fetchKuaiShouAPI(giftURL, nil, false)
+	resp, err := t.fetchKuaiShouAPI(giftURL, nil)
 	checkErr(err)
+	defer fasthttp.ReleaseResponse(resp)
+	body := resp.Body()
 
-	p := generalParserPool.Get()
-	defer generalParserPool.Put(p)
+	var p fastjson.Parser
 	v, err := p.ParseBytes(body)
 	checkErr(err)
 	if v.GetInt("result") != 1 {
@@ -320,4 +413,29 @@ func updateGiftList(v *fastjson.Value) map[int64]GiftDetail {
 	}
 
 	return gifts
+}
+
+// 通过快手API获取数据，form为nil时采用默认form，调用后需要 defer fasthttp.ReleaseResponse(resp)
+func (t *token) fetchKuaiShouAPI(url string, form *fasthttp.Args) (*fasthttp.Response, error) {
+	var apiURL string
+	if len(t.cookies) != 0 {
+		apiURL = fmt.Sprintf(url, t.userID, t.deviceID, midgroundSt, t.serviceToken)
+	} else {
+		apiURL = fmt.Sprintf(url, t.userID, t.deviceID, visitorSt, t.serviceToken)
+	}
+
+	if form == nil {
+		form = fasthttp.AcquireArgs()
+		defer fasthttp.ReleaseArgs(form)
+		form.Set("visitorId", strconv.FormatInt(t.userID, 10))
+		form.Set("liveId", t.liveID)
+	}
+	client := &httpClient{
+		url:         apiURL,
+		body:        form.QueryString(),
+		method:      "POST",
+		contentType: formContentType,
+		referer:     t.livePage,
+	}
+	return client.doRequest()
 }
