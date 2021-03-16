@@ -3,11 +3,13 @@ package acfundanmu
 import (
 	"bytes"
 	"compress/gzip"
+	"context"
 	"encoding/base64"
 	"fmt"
 	"io/ioutil"
 	"log"
 	"sort"
+	"sync/atomic"
 
 	"github.com/dgrr/fastws"
 	"github.com/orzogc/acfundanmu/acproto"
@@ -17,7 +19,7 @@ import (
 )
 
 // 处理接受到的数据里的命令
-func (dq *DanmuQueue) handleCommand(conn *fastws.Conn, stream *acproto.DownstreamPayload, hb chan<- int64, event bool) (e error) {
+func (ac *AcFunLive) handleCommand(ctx context.Context, conn *fastws.Conn, stream *acproto.DownstreamPayload, event bool) (e error) {
 	defer func() {
 		if err := recover(); err != nil {
 			e = fmt.Errorf("handleCommand() error: %w", err)
@@ -39,14 +41,14 @@ func (dq *DanmuQueue) handleCommand(conn *fastws.Conn, stream *acproto.Downstrea
 			err = proto.Unmarshal(cmd.Payload, enterRoom)
 			checkErr(err)
 			if enterRoom.HeartbeatIntervalMs > 0 {
-				hb <- enterRoom.HeartbeatIntervalMs
+				go ac.t.wsHeartbeat(ctx, conn, enterRoom.HeartbeatIntervalMs)
 			} else {
-				hb <- 10000
+				go ac.t.wsHeartbeat(ctx, conn, 10000)
 			}
 		case "ZtLiveCsHeartbeatAck":
-			heartbeat := &acproto.ZtLiveCsHeartbeatAck{}
-			err = proto.Unmarshal(cmd.Payload, heartbeat)
-			checkErr(err)
+			//heartbeat := &acproto.ZtLiveCsHeartbeatAck{}
+			//err = proto.Unmarshal(cmd.Payload, heartbeat)
+			//checkErr(err)
 		case "ZtLiveCsUserExitAck":
 			//userExit := &acproto.ZtLiveCsUserExitAck{}
 			//err = proto.Unmarshal(cmd.Payload, userExit)
@@ -58,20 +60,20 @@ func (dq *DanmuQueue) handleCommand(conn *fastws.Conn, stream *acproto.Downstrea
 				base64.StdEncoding.EncodeToString(cmd.Payload))
 		}
 	case "Basic.KeepAlive":
-		keepalive := &acproto.KeepAliveResponse{}
-		err := proto.Unmarshal(stream.PayloadData, keepalive)
-		checkErr(err)
+		//keepalive := &acproto.KeepAliveResponse{}
+		//err := proto.Unmarshal(stream.PayloadData, keepalive)
+		//checkErr(err)
 	case "Basic.Ping":
-		ping := &acproto.PingResponse{}
-		err := proto.Unmarshal(stream.PayloadData, ping)
-		checkErr(err)
+		//ping := &acproto.PingResponse{}
+		//err := proto.Unmarshal(stream.PayloadData, ping)
+		//checkErr(err)
 	case "Basic.Unregister":
 		unregister := &acproto.UnregisterResponse{}
 		err := proto.Unmarshal(stream.PayloadData, unregister)
 		checkErr(err)
-		conn.CloseString("Unregister")
+		_ = conn.CloseString("Unregister")
 	case "Push.ZtLiveInteractive.Message":
-		_, err := conn.WriteMessage(fastws.ModeBinary, dq.t.pushMessage())
+		_, err := conn.WriteMessage(fastws.ModeBinary, ac.t.pushMessage())
 		checkErr(err)
 		message := &acproto.ZtLiveScMessage{}
 		err = proto.Unmarshal(stream.PayloadData, message)
@@ -81,32 +83,30 @@ func (dq *DanmuQueue) handleCommand(conn *fastws.Conn, stream *acproto.Downstrea
 			r, err := gzip.NewReader(bytes.NewReader(message.Payload))
 			checkErr(err)
 			defer r.Close()
-			result, err := ioutil.ReadAll(r)
+			payload, err = ioutil.ReadAll(r)
 			checkErr(err)
-			payload = result
 		}
 		switch message.MessageType {
 		case "ZtLiveScActionSignal":
-			dq.handleActionSignal(&payload, event)
+			ac.handleActionSignal(&payload, event)
 		case "ZtLiveScStateSignal":
-			dq.handleStateSignal(&payload, event)
+			ac.handleStateSignal(&payload, event)
 		case "ZtLiveScNotifySignal":
-			dq.handleNotifySignal(&payload, event)
+			ac.handleNotifySignal(&payload, event)
 		case "ZtLiveScStatusChanged":
 			statusChanged := &acproto.ZtLiveScStatusChanged{}
-			err := proto.Unmarshal(payload, statusChanged)
+			err = proto.Unmarshal(payload, statusChanged)
 			checkErr(err)
 			if statusChanged.Type == acproto.ZtLiveScStatusChanged_LIVE_CLOSED || statusChanged.Type == acproto.ZtLiveScStatusChanged_LIVE_BANNED {
-				dq.t.wsStop(conn, "Live closed")
+				ac.t.wsStop(conn, "Live closed")
 			}
 		case "ZtLiveScTicketInvalid":
 			ticketInvalid := &acproto.ZtLiveScTicketInvalid{}
-			err := proto.Unmarshal(payload, ticketInvalid)
+			err = proto.Unmarshal(payload, ticketInvalid)
 			checkErr(err)
-			dq.t.Lock()
-			dq.t.ticketIndex = (dq.t.ticketIndex + 1) % len(dq.t.tickets)
-			dq.t.Unlock()
-			_, err = conn.WriteMessage(fastws.ModeBinary, dq.t.enterRoom())
+			index := atomic.LoadUint32(&ac.t.ticketIndex)
+			_ = atomic.CompareAndSwapUint32(&ac.t.ticketIndex, index, (index+1)%uint32(len(ac.t.tickets)))
+			_, err = conn.WriteMessage(fastws.ModeBinary, ac.t.enterRoom())
 			checkErr(err)
 		default:
 			log.Printf("未知的message.MessageType：%s\npayload string:\n%s\npayload base64:\n%s\n",
@@ -114,8 +114,8 @@ func (dq *DanmuQueue) handleCommand(conn *fastws.Conn, stream *acproto.Downstrea
 				string(payload),
 				base64.StdEncoding.EncodeToString(payload))
 		}
+	// AcFun帐号收到的私信信息
 	case "Push.Message":
-		// AcFun帐号收到的私信信息
 	case "Push.DataUpdate":
 	case "Push.SyncSession":
 	case "Push.acfun":
@@ -123,7 +123,7 @@ func (dq *DanmuQueue) handleCommand(conn *fastws.Conn, stream *acproto.Downstrea
 		if stream.ErrorCode > 0 {
 			log.Println("Stream Error:", stream.ErrorCode, stream.ErrorMsg)
 			if stream.ErrorCode == 10018 {
-				dq.t.wsStop(conn, "Log out")
+				ac.t.wsStop(conn, "Log out")
 			}
 			log.Println(string(stream.ErrorData))
 		} else {
@@ -138,7 +138,7 @@ func (dq *DanmuQueue) handleCommand(conn *fastws.Conn, stream *acproto.Downstrea
 }
 
 // 处理action signal数据
-func (dq *DanmuQueue) handleActionSignal(payload *[]byte, event bool) {
+func (ac *AcFunLive) handleActionSignal(payload *[]byte, event bool) {
 	actionSignal := &acproto.ZtLiveScActionSignal{}
 	err := proto.Unmarshal(*payload, actionSignal)
 	checkErr(err)
@@ -149,11 +149,11 @@ func (dq *DanmuQueue) handleActionSignal(payload *[]byte, event bool) {
 			switch item.SignalType {
 			case "CommonActionSignalComment":
 				comment := &acproto.CommonActionSignalComment{}
-				err := proto.Unmarshal(pl, comment)
+				err = proto.Unmarshal(pl, comment)
 				checkErr(err)
 				d := &Comment{
 					DanmuCommon: DanmuCommon{
-						SendTime: comment.SendTimeMs * 1e6,
+						SendTime: comment.SendTimeMs,
 						UserInfo: UserInfo{
 							UserID:   comment.UserInfo.UserId,
 							Nickname: comment.UserInfo.Nickname,
@@ -161,62 +161,54 @@ func (dq *DanmuQueue) handleActionSignal(payload *[]byte, event bool) {
 					},
 					Content: comment.Content,
 				}
-				dq.t.getMoreInfo(&d.UserInfo, comment.UserInfo)
+				ac.t.getMoreInfo(&d.UserInfo, comment.UserInfo)
 				danmu = append(danmu, d)
 			case "CommonActionSignalLike":
 				like := &acproto.CommonActionSignalLike{}
-				err := proto.Unmarshal(pl, like)
+				err = proto.Unmarshal(pl, like)
 				checkErr(err)
 				d := &Like{
-					SendTime: like.SendTimeMs * 1e6,
+					SendTime: like.SendTimeMs,
 					UserInfo: UserInfo{
 						UserID:   like.UserInfo.UserId,
 						Nickname: like.UserInfo.Nickname,
 					},
 				}
-				dq.t.getMoreInfo(&d.UserInfo, like.UserInfo)
+				ac.t.getMoreInfo(&d.UserInfo, like.UserInfo)
 				danmu = append(danmu, d)
 			case "CommonActionSignalUserEnterRoom":
 				enter := &acproto.CommonActionSignalUserEnterRoom{}
-				err := proto.Unmarshal(pl, enter)
+				err = proto.Unmarshal(pl, enter)
 				checkErr(err)
 				d := &EnterRoom{
-					SendTime: enter.SendTimeMs * 1e6,
+					SendTime: enter.SendTimeMs,
 					UserInfo: UserInfo{
 						UserID:   enter.UserInfo.UserId,
 						Nickname: enter.UserInfo.Nickname,
 					},
 				}
-				dq.t.getMoreInfo(&d.UserInfo, enter.UserInfo)
+				ac.t.getMoreInfo(&d.UserInfo, enter.UserInfo)
 				danmu = append(danmu, d)
 			case "CommonActionSignalUserFollowAuthor":
 				follow := &acproto.CommonActionSignalUserFollowAuthor{}
-				err := proto.Unmarshal(pl, follow)
+				err = proto.Unmarshal(pl, follow)
 				checkErr(err)
 				d := &FollowAuthor{
-					SendTime: follow.SendTimeMs * 1e6,
+					SendTime: follow.SendTimeMs,
 					UserInfo: UserInfo{
 						UserID:   follow.UserInfo.UserId,
 						Nickname: follow.UserInfo.Nickname,
 					},
 				}
-				dq.t.getMoreInfo(&d.UserInfo, follow.UserInfo)
+				ac.t.getMoreInfo(&d.UserInfo, follow.UserInfo)
 				danmu = append(danmu, d)
-			/*
-				case "CommonNotifySignalKickedOut":
-					t.handleNotifySignal(signalType, &pl, info)
-				case "CommonNotifySignalViolationAlert":
-					t.handleNotifySignal(signalType, &pl, info)
-				case "CommonNotifySignalLiveManagerState":
-					t.handleNotifySignal(signalType, &pl, info)
-			*/
 			case "AcfunActionSignalThrowBanana":
 				banana := &acproto.AcfunActionSignalThrowBanana{}
-				err := proto.Unmarshal(pl, banana)
+				err = proto.Unmarshal(pl, banana)
 				checkErr(err)
 				d := &ThrowBanana{
 					DanmuCommon: DanmuCommon{
-						SendTime: banana.SendTimeMs * 1e6,
+						SendTime: banana.SendTimeMs,
 						UserInfo: UserInfo{
 							UserID:   banana.Visitor.UserId,
 							Nickname: banana.Visitor.Name,
@@ -227,10 +219,10 @@ func (dq *DanmuQueue) handleActionSignal(payload *[]byte, event bool) {
 				danmu = append(danmu, d)
 			case "CommonActionSignalGift":
 				gift := &acproto.CommonActionSignalGift{}
-				err := proto.Unmarshal(pl, gift)
+				err = proto.Unmarshal(pl, gift)
 				checkErr(err)
 				// 礼物列表应该不会在直播中途改变，但以防万一
-				g, ok := dq.t.gifts[gift.GiftId]
+				g, ok := ac.t.gifts[gift.GiftId]
 				if !ok {
 					g = GiftDetail{
 						GiftID:   gift.GiftId,
@@ -239,21 +231,21 @@ func (dq *DanmuQueue) handleActionSignal(payload *[]byte, event bool) {
 				}
 				d := &Gift{
 					DanmuCommon: DanmuCommon{
-						SendTime: gift.SendTimeMs * 1e6,
+						SendTime: gift.SendTimeMs,
 						UserInfo: UserInfo{
 							UserID:   gift.User.UserId,
 							Nickname: gift.User.Nickname,
 						},
 					},
-					GiftDetail:            g,
-					Count:                 gift.Count,
-					Combo:                 gift.Combo,
-					Value:                 gift.Value,
-					ComboID:               gift.ComboId,
-					SlotDisplayDurationMs: gift.SlotDisplayDurationMs,
-					ExpireDurationMs:      gift.ExpireDurationMs,
+					GiftDetail:          g,
+					Count:               gift.Count,
+					Combo:               gift.Combo,
+					Value:               gift.Value,
+					ComboID:             gift.ComboId,
+					SlotDisplayDuration: gift.SlotDisplayDurationMs,
+					ExpireDuration:      gift.ExpireDurationMs,
 				}
-				dq.t.getMoreInfo(&d.UserInfo, gift.User)
+				ac.t.getMoreInfo(&d.UserInfo, gift.User)
 				if gift.DrawGiftInfo != nil {
 					d.DrawGiftInfo = DrawGiftInfo{
 						ScreenWidth:  gift.DrawGiftInfo.ScreenWidth,
@@ -272,10 +264,10 @@ func (dq *DanmuQueue) handleActionSignal(payload *[]byte, event bool) {
 				danmu = append(danmu, d)
 			case "CommonActionSignalRichText":
 				richText := &acproto.CommonActionSignalRichText{}
-				err := proto.Unmarshal(pl, richText)
+				err = proto.Unmarshal(pl, richText)
 				checkErr(err)
 				d := &RichText{
-					SendTime: richText.SendTimeMs * 1e6,
+					SendTime: richText.SendTimeMs,
 				}
 				d.Segments = make([]RichTextSegment, len(richText.Segments))
 				for i, segment := range richText.Segments {
@@ -288,7 +280,7 @@ func (dq *DanmuQueue) handleActionSignal(payload *[]byte, event bool) {
 							},
 							Color: segment.UserInfo.Color,
 						}
-						dq.t.getMoreInfo(&userInfo.UserInfo, segment.UserInfo.User)
+						ac.t.getMoreInfo(&userInfo.UserInfo, segment.UserInfo.User)
 						d.Segments[i] = userInfo
 					case *acproto.CommonActionSignalRichText_RichTextSegment_Plain:
 						plain := &RichTextPlain{
@@ -313,10 +305,10 @@ func (dq *DanmuQueue) handleActionSignal(payload *[]byte, event bool) {
 				danmu = append(danmu, d)
 			case "AcfunActionSignalJoinClub":
 				join := &acproto.AcfunActionSignalJoinClub{}
-				err := proto.Unmarshal(pl, join)
+				err = proto.Unmarshal(pl, join)
 				checkErr(err)
 				d := &JoinClub{
-					JoinTime: join.JoinTimeMs * 1e6,
+					JoinTime: join.JoinTimeMs,
 					FansInfo: UserInfo{
 						UserID:   join.FansInfo.UserId,
 						Nickname: join.FansInfo.Name,
@@ -345,33 +337,33 @@ func (dq *DanmuQueue) handleActionSignal(payload *[]byte, event bool) {
 		if event {
 			switch d := d.(type) {
 			case *Comment:
-				dq.dispatchEvent(commentDanmu, d)
+				ac.callEvent(commentDanmu, d)
 			case *Like:
-				dq.dispatchEvent(likeDanmu, d)
+				ac.callEvent(likeDanmu, d)
 			case *EnterRoom:
-				dq.dispatchEvent(enterRoomDanmu, d)
+				ac.callEvent(enterRoomDanmu, d)
 			case *FollowAuthor:
-				dq.dispatchEvent(followAuthorDanmu, d)
+				ac.callEvent(followAuthorDanmu, d)
 			case *ThrowBanana:
-				dq.dispatchEvent(throwBananaDanmu, d)
+				ac.callEvent(throwBananaDanmu, d)
 			case *Gift:
-				dq.dispatchEvent(giftDanmu, d)
+				ac.callEvent(giftDanmu, d)
 			case *RichText:
-				dq.dispatchEvent(richTextDanmu, d)
+				ac.callEvent(richTextDanmu, d)
 			case *JoinClub:
-				dq.dispatchEvent(joinClubDanmu, d)
+				ac.callEvent(joinClubDanmu, d)
 			default:
 				log.Println("出现未处理的DanmuMessage")
 			}
 		} else {
-			err = dq.q.Put(d)
+			err = ac.q.Put(d)
 			checkErr(err)
 		}
 	}
 }
 
 // 处理state signal数据
-func (dq *DanmuQueue) handleStateSignal(payload *[]byte, event bool) {
+func (ac *AcFunLive) handleStateSignal(payload *[]byte, event bool) {
 	stateSignal := &acproto.ZtLiveScStateSignal{}
 	err := proto.Unmarshal(*payload, stateSignal)
 	checkErr(err)
@@ -380,18 +372,18 @@ func (dq *DanmuQueue) handleStateSignal(payload *[]byte, event bool) {
 		switch item.SignalType {
 		case "AcfunStateSignalDisplayInfo":
 			bananaInfo := &acproto.AcfunStateSignalDisplayInfo{}
-			err := proto.Unmarshal(item.Payload, bananaInfo)
+			err = proto.Unmarshal(item.Payload, bananaInfo)
 			checkErr(err)
 			if event {
-				dq.dispatchEvent(bananaCountInfo, bananaInfo.BananaCount)
+				ac.callEvent(bananaCountEvent, bananaInfo.BananaCount)
 			} else {
-				dq.info.Lock()
-				dq.info.AllBananaCount = bananaInfo.BananaCount
-				dq.info.Unlock()
+				ac.info.Lock()
+				ac.info.AllBananaCount = bananaInfo.BananaCount
+				ac.info.Unlock()
 			}
 		case "CommonStateSignalDisplayInfo":
 			stateInfo := &acproto.CommonStateSignalDisplayInfo{}
-			err := proto.Unmarshal(item.Payload, stateInfo)
+			err = proto.Unmarshal(item.Payload, stateInfo)
 			checkErr(err)
 			info := DisplayInfo{
 				WatchingCount: stateInfo.WatchingCount,
@@ -399,15 +391,15 @@ func (dq *DanmuQueue) handleStateSignal(payload *[]byte, event bool) {
 				LikeDelta:     int(stateInfo.LikeDelta),
 			}
 			if event {
-				dq.dispatchEvent(displayInfo, &info)
+				ac.callEvent(displayEvent, &info)
 			} else {
-				dq.info.Lock()
-				dq.info.DisplayInfo = info
-				dq.info.Unlock()
+				ac.info.Lock()
+				ac.info.DisplayInfo = info
+				ac.info.Unlock()
 			}
 		case "CommonStateSignalTopUsers":
 			topUsers := &acproto.CommonStateSignalTopUsers{}
-			err := proto.Unmarshal(item.Payload, topUsers)
+			err = proto.Unmarshal(item.Payload, topUsers)
 			checkErr(err)
 			users := make([]TopUser, len(topUsers.User))
 			for i, user := range topUsers.User {
@@ -420,25 +412,25 @@ func (dq *DanmuQueue) handleStateSignal(payload *[]byte, event bool) {
 					DisplaySendAmount: user.DisplaySendAmount,
 					CustomData:        user.CustomWatchingListData,
 				}
-				dq.t.getMoreInfo(&u.UserInfo, user.UserInfo)
+				ac.t.getMoreInfo(&u.UserInfo, user.UserInfo)
 				users[i] = u
 			}
 			if event {
-				dq.dispatchEvent(topUsersInfo, users)
+				ac.callEvent(topUsersEvent, users)
 			} else {
-				dq.info.Lock()
-				dq.info.TopUsers = users
-				dq.info.Unlock()
+				ac.info.Lock()
+				ac.info.TopUsers = users
+				ac.info.Unlock()
 			}
 		case "CommonStateSignalRecentComment":
 			comments := &acproto.CommonStateSignalRecentComment{}
-			err := proto.Unmarshal(item.Payload, comments)
+			err = proto.Unmarshal(item.Payload, comments)
 			checkErr(err)
 			danmu := make([]Comment, len(comments.Comment))
 			for i, comment := range comments.Comment {
 				d := Comment{
 					DanmuCommon: DanmuCommon{
-						SendTime: comment.SendTimeMs * 1e6,
+						SendTime: comment.SendTimeMs,
 						UserInfo: UserInfo{
 							UserID:   comment.UserInfo.UserId,
 							Nickname: comment.UserInfo.Nickname,
@@ -446,68 +438,19 @@ func (dq *DanmuQueue) handleStateSignal(payload *[]byte, event bool) {
 					},
 					Content: comment.Content,
 				}
-				dq.t.getMoreInfo(&d.UserInfo, comment.UserInfo)
+				ac.t.getMoreInfo(&d.UserInfo, comment.UserInfo)
 				danmu[i] = d
 			}
 			if event {
-				dq.dispatchEvent(recentCommentInfo, danmu)
+				ac.callEvent(recentCommentEvent, danmu)
 			} else {
-				dq.info.Lock()
-				dq.info.RecentComment = danmu
-				dq.info.Unlock()
-			}
-		case "CommonStateSignalChatCall":
-			chatCall := &acproto.CommonStateSignalChatCall{}
-			err := proto.Unmarshal(item.Payload, chatCall)
-			checkErr(err)
-			if event {
-				dq.dispatchEvent(chatCallInfo, &ChatCall{
-					ChatID:   chatCall.ChatId,
-					LiveID:   chatCall.LiveId,
-					CallTime: chatCall.CallTimestampMs * 1e6,
-				})
-			}
-		case "CommonStateSignalChatAccept":
-			chatAccept := &acproto.CommonStateSignalChatAccept{}
-			err := proto.Unmarshal(item.Payload, chatAccept)
-			checkErr(err)
-			log.Printf("CommonStateSignalChatAccept: %+v\n", chatAccept)
-			if event {
-				dq.dispatchEvent(chatAcceptInfo, &ChatAccept{
-					ChatID:          chatAccept.ChatId,
-					MediaType:       ChatMediaType(chatAccept.MediaType),
-					ArraySignalInfo: chatAccept.ArraySignalInfo,
-				})
-			}
-		case "CommonStateSignalChatReady":
-			chatReady := &acproto.CommonStateSignalChatReady{}
-			err := proto.Unmarshal(item.Payload, chatReady)
-			checkErr(err)
-			guest := UserInfo{
-				UserID:   chatReady.GuestUserInfo.UserId,
-				Nickname: chatReady.GuestUserInfo.Nickname,
-			}
-			dq.t.getMoreInfo(&guest, chatReady.GuestUserInfo)
-			if event {
-				dq.dispatchEvent(chatReadyInfo, &ChatReady{
-					ChatID:    chatReady.ChatId,
-					Guest:     guest,
-					MediaType: ChatMediaType(chatReady.MediaType),
-				})
-			}
-		case "CommonStateSignalChatEnd":
-			chatEnd := &acproto.CommonStateSignalChatEnd{}
-			err := proto.Unmarshal(item.Payload, chatEnd)
-			checkErr(err)
-			if event {
-				dq.dispatchEvent(chatEndInfo, &ChatEnd{
-					ChatID:  chatEnd.ChatId,
-					EndType: ChatEndType(chatEnd.EndType),
-				})
+				ac.info.Lock()
+				ac.info.RecentComment = danmu
+				ac.info.Unlock()
 			}
 		case "CommonStateSignalCurrentRedpackList":
 			redpackList := &acproto.CommonStateSignalCurrentRedpackList{}
-			err := proto.Unmarshal(item.Payload, redpackList)
+			err = proto.Unmarshal(item.Payload, redpackList)
 			checkErr(err)
 			redpacks := make([]Redpack, len(redpackList.Redpacks))
 			for i, redpack := range redpackList.Redpacks {
@@ -517,22 +460,150 @@ func (dq *DanmuQueue) handleStateSignal(payload *[]byte, event bool) {
 						Nickname: redpack.Sender.Nickname,
 					},
 					DisplayStatus:      RedpackDisplayStatus(redpack.DisplayStatus),
-					GrabBeginTime:      redpack.GrabBeginTimeMs * 1e6,
-					GetTokenLatestTime: redpack.GetTokenLatestTimeMs * 1e6,
-					RedPackID:          redpack.RedPackId,
+					GrabBeginTime:      redpack.GrabBeginTimeMs,
+					GetTokenLatestTime: redpack.GetTokenLatestTimeMs,
+					RedpackID:          redpack.RedPackId,
 					RedpackBizUnit:     redpack.RedpackBizUnit,
 					RedpackAmount:      redpack.RedpackAmount,
-					SettleBeginTime:    redpack.SettleBeginTime * 1e6,
+					SettleBeginTime:    redpack.SettleBeginTime,
 				}
-				dq.t.getMoreInfo(&r.UserInfo, redpack.Sender)
+				ac.t.getMoreInfo(&r.UserInfo, redpack.Sender)
 				redpacks[i] = r
 			}
 			if event {
-				dq.dispatchEvent(redpackListInfo, redpacks)
+				ac.callEvent(redpackListEvent, redpacks)
 			} else {
-				dq.info.Lock()
-				dq.info.RedpackList = redpacks
-				dq.info.Unlock()
+				ac.info.Lock()
+				ac.info.RedpackList = redpacks
+				ac.info.Unlock()
+			}
+		case "CommonStateSignalChatCall":
+			chatCall := &acproto.CommonStateSignalChatCall{}
+			err = proto.Unmarshal(item.Payload, chatCall)
+			checkErr(err)
+			if event {
+				ac.callEvent(chatCallEvent, &ChatCall{
+					ChatID:   chatCall.ChatId,
+					LiveID:   chatCall.LiveId,
+					CallTime: chatCall.CallTimestampMs,
+				})
+			}
+		case "CommonStateSignalChatAccept":
+			chatAccept := &acproto.CommonStateSignalChatAccept{}
+			err = proto.Unmarshal(item.Payload, chatAccept)
+			checkErr(err)
+			if event {
+				ac.callEvent(chatAcceptEvent, &ChatAccept{
+					ChatID:     chatAccept.ChatId,
+					MediaType:  ChatMediaType(chatAccept.MediaType),
+					SignalInfo: chatAccept.AryaSignalInfo,
+				})
+			}
+		case "CommonStateSignalChatReady":
+			chatReady := &acproto.CommonStateSignalChatReady{}
+			err = proto.Unmarshal(item.Payload, chatReady)
+			checkErr(err)
+			guest := UserInfo{
+				UserID:   chatReady.GuestUserInfo.UserId,
+				Nickname: chatReady.GuestUserInfo.Nickname,
+			}
+			ac.t.getMoreInfo(&guest, chatReady.GuestUserInfo)
+			if event {
+				ac.callEvent(chatReadyEvent, &ChatReady{
+					ChatID:    chatReady.ChatId,
+					Guest:     guest,
+					MediaType: ChatMediaType(chatReady.MediaType),
+				})
+			}
+		case "CommonStateSignalChatEnd":
+			chatEnd := &acproto.CommonStateSignalChatEnd{}
+			err = proto.Unmarshal(item.Payload, chatEnd)
+			checkErr(err)
+			if event {
+				ac.callEvent(chatEndEvent, &ChatEnd{
+					ChatID:  chatEnd.ChatId,
+					EndType: ChatEndType(chatEnd.EndType),
+				})
+			}
+		case "CommonStateSignalAuthorChatCall":
+			chatCall := &acproto.CommonStateSignalAuthorChatCall{}
+			err = proto.Unmarshal(item.Payload, chatCall)
+			checkErr(err)
+			inviter := UserInfo{
+				UserID:   chatCall.InviterUserInfo.Player.UserId,
+				Nickname: chatCall.InviterUserInfo.Player.Nickname,
+			}
+			ac.t.getMoreInfo(&inviter, chatCall.InviterUserInfo.Player)
+			if event {
+				ac.callEvent(authorChatCallEvent, &AuthorChatCall{
+					Inviter: AuthorChatPlayerInfo{
+						UserInfo:               inviter,
+						LiveID:                 chatCall.InviterUserInfo.LiveId,
+						EnableJumpPeerLiveRoom: chatCall.InviterUserInfo.EnableJumpPeerLiveRoom,
+					},
+					ChatID:   chatCall.AuthorChatId,
+					CallTime: chatCall.CallTimestampMs,
+				})
+			}
+		case "CommonStateSignalAuthorChatAccept":
+			chatAccept := &acproto.CommonStateSignalAuthorChatAccept{}
+			err = proto.Unmarshal(item.Payload, chatAccept)
+			checkErr(err)
+			if event {
+				ac.callEvent(authorChatAcceptEvent, &AuthorChatAccept{
+					ChatID:     chatAccept.AuthorChatId,
+					SignalInfo: chatAccept.AryaSignalInfo,
+				})
+			}
+		case "CommonStateSignalAuthorChatReady":
+			chatReady := &acproto.CommonStateSignalAuthorChatReady{}
+			err = proto.Unmarshal(item.Payload, chatReady)
+			checkErr(err)
+			inviter := UserInfo{
+				UserID:   chatReady.InviterUserInfo.Player.UserId,
+				Nickname: chatReady.InviterUserInfo.Player.Nickname,
+			}
+			ac.t.getMoreInfo(&inviter, chatReady.InviterUserInfo.Player)
+			invitee := UserInfo{
+				UserID:   chatReady.InviteeUserInfo.Player.UserId,
+				Nickname: chatReady.InviteeUserInfo.Player.Nickname,
+			}
+			ac.t.getMoreInfo(&invitee, chatReady.InviteeUserInfo.Player)
+			if event {
+				ac.callEvent(authorChatReadyEvent, &AuthorChatReady{
+					Inviter: AuthorChatPlayerInfo{
+						UserInfo:               inviter,
+						LiveID:                 chatReady.InviterUserInfo.LiveId,
+						EnableJumpPeerLiveRoom: chatReady.InviterUserInfo.EnableJumpPeerLiveRoom,
+					},
+					Invitee: AuthorChatPlayerInfo{
+						UserInfo:               invitee,
+						LiveID:                 chatReady.InviteeUserInfo.LiveId,
+						EnableJumpPeerLiveRoom: chatReady.InviteeUserInfo.EnableJumpPeerLiveRoom,
+					},
+					ChatID: chatReady.AuthorChatId,
+				})
+			}
+		case "CommonStateSignalAuthorChatEnd":
+			chatEnd := &acproto.CommonStateSignalAuthorChatEnd{}
+			err = proto.Unmarshal(item.Payload, chatEnd)
+			checkErr(err)
+			if event {
+				ac.callEvent(authorChatEndEvent, &AuthorChatEnd{
+					ChatID:    chatEnd.AuthorChatId,
+					EndType:   ChatEndType(chatEnd.EndType),
+					EndLiveID: chatEnd.EndLiveId,
+				})
+			}
+		case "CommonStateSignalAuthorChatChangeSoundConfig":
+			chatConfig := &acproto.CommonStateSignalAuthorChatChangeSoundConfig{}
+			err = proto.Unmarshal(item.Payload, chatConfig)
+			checkErr(err)
+			if event {
+				ac.callEvent(authorChatChangeSoundConfigEvent, &AuthorChatChangeSoundConfig{
+					ChatID:                chatConfig.AuthorChatId,
+					SoundConfigChangeType: SoundConfigChangeType(chatConfig.SoundConfigChangeType),
+				})
 			}
 		default:
 			log.Printf("未知的State Signal item.SignalType：%s\npayload string:\n%s\npayload base64:\n%s\n",
@@ -544,7 +615,7 @@ func (dq *DanmuQueue) handleStateSignal(payload *[]byte, event bool) {
 }
 
 // 处理notify signal数据
-func (dq *DanmuQueue) handleNotifySignal(payload *[]byte, event bool) {
+func (ac *AcFunLive) handleNotifySignal(payload *[]byte, event bool) {
 	notifySignal := &acproto.ZtLiveScNotifySignal{}
 	err := proto.Unmarshal(*payload, notifySignal)
 	checkErr(err)
@@ -553,36 +624,36 @@ func (dq *DanmuQueue) handleNotifySignal(payload *[]byte, event bool) {
 		switch item.SignalType {
 		case "CommonNotifySignalKickedOut":
 			kickedOut := &acproto.CommonNotifySignalKickedOut{}
-			err := proto.Unmarshal(item.Payload, kickedOut)
+			err = proto.Unmarshal(item.Payload, kickedOut)
 			checkErr(err)
 			if event {
-				dq.dispatchEvent(kickedOutInfo, kickedOut.Reason)
+				ac.callEvent(kickedOutEvent, kickedOut.Reason)
 			} else {
-				dq.info.Lock()
-				dq.info.KickedOut = kickedOut.Reason
-				dq.info.Unlock()
+				ac.info.Lock()
+				ac.info.KickedOut = kickedOut.Reason
+				ac.info.Unlock()
 			}
 		case "CommonNotifySignalViolationAlert":
 			violationAlert := &acproto.CommonNotifySignalViolationAlert{}
-			err := proto.Unmarshal(item.Payload, violationAlert)
+			err = proto.Unmarshal(item.Payload, violationAlert)
 			checkErr(err)
 			if event {
-				dq.dispatchEvent(violationAlertInfo, violationAlert.ViolationContent)
+				ac.callEvent(violationAlertEvent, violationAlert.ViolationContent)
 			} else {
-				dq.info.Lock()
-				dq.info.ViolationAlert = violationAlert.ViolationContent
-				dq.info.Unlock()
+				ac.info.Lock()
+				ac.info.ViolationAlert = violationAlert.ViolationContent
+				ac.info.Unlock()
 			}
 		case "CommonNotifySignalLiveManagerState":
 			liveManagerState := &acproto.CommonNotifySignalLiveManagerState{}
-			err := proto.Unmarshal(item.Payload, liveManagerState)
+			err = proto.Unmarshal(item.Payload, liveManagerState)
 			checkErr(err)
 			if event {
-				dq.dispatchEvent(managerStateInfo, liveManagerState.State)
+				ac.callEvent(managerStateEvent, liveManagerState.State)
 			} else {
-				dq.info.Lock()
-				dq.info.LiveManagerState = ManagerState(liveManagerState.State)
-				dq.info.Unlock()
+				ac.info.Lock()
+				ac.info.LiveManagerState = ManagerState(liveManagerState.State)
+				ac.info.Unlock()
 			}
 		default:
 			log.Printf("未知的Notify Signal signalType：%s\npayload string:\n%s\npayload base64:\n%s\n",
@@ -600,8 +671,8 @@ func (t *token) getMoreInfo(user *UserInfo, userInfo *acproto.ZtLiveUserInfo) {
 	}
 
 	if userInfo.Badge != "" {
-		p := t.medalParser.Get()
-		defer t.medalParser.Put(p)
+		p := medalParserPool.Get()
+		defer medalParserPool.Put(p)
 		v, err := p.Parse(userInfo.Badge)
 		checkErr(err)
 		o := v.GetObject("medalInfo")

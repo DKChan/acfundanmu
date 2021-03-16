@@ -10,6 +10,8 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/orzogc/acfundanmu/acproto"
@@ -17,15 +19,27 @@ import (
 	"google.golang.org/protobuf/proto"
 )
 
+const maxBytesLength = 2000
+
+var lengthPool = sync.Pool{
+	New: func() interface{} {
+		return make([]byte, 4)
+	},
+}
+
+var bytesPool = sync.Pool{
+	New: func() interface{} {
+		return make([]byte, maxBytesLength)
+	},
+}
+
 // 生成ZtLiveCsCmd
 func (t *token) genCommand(command string, msg []byte) []byte {
-	t.Lock()
 	cmd := &acproto.ZtLiveCsCmd{
 		CmdType: command,
-		Ticket:  t.tickets[t.ticketIndex],
+		Ticket:  t.tickets[atomic.LoadUint32(&t.ticketIndex)],
 		LiveId:  t.liveID,
 	}
-	t.Unlock()
 	if msg != nil {
 		cmd.Payload = msg
 	}
@@ -38,14 +52,12 @@ func (t *token) genCommand(command string, msg []byte) []byte {
 
 // 生成UpstreamPayload
 func (t *token) genPayload(cmd string, msg []byte) []byte {
-	t.Lock()
 	payload := &acproto.UpstreamPayload{
 		Command:    cmd,
-		SeqId:      t.seqID,
+		SeqId:      atomic.LoadInt64(&t.seqID),
 		RetryCount: retryCount,
 		SubBiz:     subBiz,
 	}
-	t.Unlock()
 	if msg != nil {
 		payload.PayloadData = msg
 	}
@@ -58,17 +70,15 @@ func (t *token) genPayload(cmd string, msg []byte) []byte {
 
 // 生成PacketHeader
 func (t *token) genHeader(length int) (header *acproto.PacketHeader) {
-	t.Lock()
 	header = &acproto.PacketHeader{
 		AppId:             appID,
-		Uid:               t.userID,
+		Uid:               t.UserID,
 		InstanceId:        t.instanceID,
 		DecodedPayloadLen: uint32(length),
 		EncryptionMode:    acproto.PacketHeader_kEncryptionSessionKey,
-		SeqId:             t.seqID,
+		SeqId:             atomic.LoadInt64(&t.seqID),
 		Kpn:               kpn,
 	}
-	t.Unlock()
 	return header
 }
 
@@ -89,7 +99,7 @@ func (t *token) register() []byte {
 		ZtCommonInfo: &acproto.ZtCommonInfo{
 			Kpn: kpn,
 			Kpf: kpf,
-			Uid: t.userID,
+			Uid: t.UserID,
 		},
 	}
 
@@ -102,9 +112,9 @@ func (t *token) register() []byte {
 	header.EncryptionMode = acproto.PacketHeader_kEncryptionServiceToken
 	header.TokenInfo = &acproto.TokenInfo{
 		TokenType: acproto.TokenInfo_kServiceToken,
-		Token:     []byte(t.serviceToken),
+		Token:     []byte(t.ServiceToken),
 	}
-	t.seqID++
+	_ = atomic.AddInt64(&t.seqID, 1)
 
 	return t.encode(header, body)
 }
@@ -147,15 +157,13 @@ func (t *token) enterRoom() []byte {
 	body := t.genPayload("Global.ZtLiveInteractive.CsCmd", cmd)
 
 	header := t.genHeader(len(body))
-	t.Lock()
-	t.seqID++
-	t.Unlock()
+	_ = atomic.AddInt64(&t.seqID, 1)
 
 	return t.encode(header, body)
 }
 
 // KeepAlive数据
-func (t *token) keepAlive(increase bool) []byte {
+func (t *token) keepAlive() []byte {
 	keepAlive := &acproto.KeepAliveRequest{
 		PresenceStatus:  acproto.RegisterRequest_kPresenceOnline,
 		AppActiveStatus: acproto.RegisterRequest_kAppInForeground,
@@ -167,9 +175,7 @@ func (t *token) keepAlive(increase bool) []byte {
 
 	header := t.genHeader(len(body))
 
-	if increase {
-		t.seqID++
-	}
+	_ = atomic.AddInt64(&t.seqID, 1)
 
 	return t.encode(header, body)
 }
@@ -179,9 +185,7 @@ func (t *token) pushMessage() []byte {
 	body := t.genPayload("Push.ZtLiveInteractive.Message", nil)
 
 	header := t.genHeader((len(body)))
-	t.Lock()
-	header.SeqId = t.headerSeqID
-	t.Unlock()
+	header.SeqId = atomic.LoadInt64(&t.headerSeqID)
 
 	return t.encode(header, body)
 }
@@ -201,9 +205,7 @@ func (t *token) heartbeat() []byte {
 
 	header := t.genHeader(len(body))
 	t.heartbeatSeqID++
-	t.Lock()
-	t.seqID++
-	t.Unlock()
+	_ = atomic.AddInt64(&t.seqID, 1)
 
 	return t.encode(header, body)
 }
@@ -215,9 +217,7 @@ func (t *token) userExit() []byte {
 	body := t.genPayload("Global.ZtLiveInteractive.CsCmd", cmd)
 
 	header := t.genHeader(len(body))
-	t.Lock()
-	t.seqID++
-	t.Unlock()
+	_ = atomic.AddInt64(&t.seqID, 1)
 
 	return t.encode(header, body)
 }
@@ -230,7 +230,8 @@ func (t *token) encode(header *acproto.PacketHeader, body []byte) []byte {
 	// 选择密钥
 	key := t.sessionKey
 	if header.EncryptionMode == acproto.PacketHeader_kEncryptionServiceToken {
-		key = t.securityKey
+		key, err = base64.StdEncoding.DecodeString(t.SecurityKey)
+		checkErr(err)
 	}
 	encrypted := encrypt(key, body)
 
@@ -245,17 +246,14 @@ func (t *token) encode(header *acproto.PacketHeader, body []byte) []byte {
 	buf.Write(headerBytes)
 	buf.Write(encrypted)
 
-	b := buf.Bytes()
-	return b
+	return buf.Bytes()
 }
 
 // 根据密钥加密body，加密方式为aes-128-cbc
-func encrypt(key string, body []byte) []byte {
-	keyBytes, err := base64.StdEncoding.DecodeString(key)
-	checkErr(err)
+func encrypt(key []byte, body []byte) []byte {
 	body = padding(body, aes.BlockSize)
 
-	block, err := aes.NewCipher(keyBytes)
+	block, err := aes.NewCipher(key)
 	checkErr(err)
 	cipherText := make([]byte, len(body))
 	iv := make([]byte, aes.BlockSize)
@@ -264,57 +262,31 @@ func encrypt(key string, body []byte) []byte {
 	mode := cipher.NewCBCEncrypter(block, iv)
 	mode.CryptBlocks(cipherText, body)
 
-	encrypted := append(iv, cipherText...)
-	return encrypted
+	return append(iv, cipherText...)
 }
 
 // aes-128-cbc的padding（PKCS #7）
 func padding(cipherText []byte, blockSize int) []byte {
 	padding := (blockSize - len(cipherText)%blockSize)
 	padText := bytes.Repeat([]byte{byte(padding)}, padding)
-	text := append(cipherText, padText...)
-	return text
+
+	return append(cipherText, padText...)
 }
 
 // 将body/payload从数据中分离出来
-func (t *token) decode(byt []byte) (downstream *acproto.DownstreamPayload, e error) {
+func (t *token) decode(b []byte) (downstream *acproto.DownstreamPayload, e error) {
 	defer func() {
 		if err := recover(); err != nil {
 			e = fmt.Errorf("decode() error: %w", err)
 		}
 	}()
 
-	header, payloadBytes := decodeResponse(byt)
-	t.Lock()
-	t.headerSeqID = header.SeqId
-	t.Unlock()
-
-	payload := payloadBytes
-	if header.EncryptionMode != acproto.PacketHeader_kEncryptionNone {
-		key := t.sessionKey
-		if header.EncryptionMode == acproto.PacketHeader_kEncryptionServiceToken {
-			key = t.securityKey
-		}
-		payload = decrypt(payloadBytes, key)
-	}
-
-	if len(payload) != int(header.DecodedPayloadLen) {
-		panic(fmt.Errorf("the length of body/payload is wrong: payload %d header %d", len(payload), header.DecodedPayloadLen))
-	}
-
-	downstream = &acproto.DownstreamPayload{}
-	err := proto.Unmarshal(payload, downstream)
-	checkErr(err)
-
-	return downstream, nil
-}
-
-// 分离header和body/payload
-func decodeResponse(byt []byte) (*acproto.PacketHeader, []byte) {
-	reader := bytes.NewReader(byt)
+	// 分离header和body/payload
+	reader := bytes.NewReader(b)
 
 	// 具体数据格式看https://github.com/wpscott/AcFunDanmaku/tree/master/AcFunDanmu
-	length := make([]byte, 4)
+	length := lengthPool.Get().([]byte)
+	defer lengthPool.Put(length)
 	// 忽略第一个4字节数据
 	_, err := reader.Read(length)
 	checkErr(err)
@@ -328,39 +300,74 @@ func decodeResponse(byt []byte) (*acproto.PacketHeader, []byte) {
 	payloadLength := binary.BigEndian.Uint32(length)
 
 	// header数据
-	headerBytes := make([]byte, headerLength)
+	var headerBytes []byte
+	if headerLength <= maxBytesLength {
+		byt := bytesPool.Get().([]byte)
+		defer bytesPool.Put(byt)
+		headerBytes = byt[:headerLength]
+	} else {
+		headerBytes = make([]byte, headerLength)
+	}
 	_, err = reader.Read(headerBytes)
 	checkErr(err)
 
 	// body/payload数据
-	payloadBytes := make([]byte, payloadLength)
-	_, err = reader.Read(payloadBytes)
+	var payload []byte
+	if payloadLength <= maxBytesLength {
+		byt := bytesPool.Get().([]byte)
+		defer bytesPool.Put(byt)
+		payload = byt[:payloadLength]
+	} else {
+		payload = make([]byte, payloadLength)
+	}
+	_, err = reader.Read(payload)
 	checkErr(err)
+
+	if reader.Len() != 0 {
+		log.Printf("decode(): reader has more %d bytes", reader.Len())
+	}
 
 	header := &acproto.PacketHeader{}
 	err = proto.Unmarshal(headerBytes, header)
 	checkErr(err)
 
-	return header, payloadBytes
+	atomic.StoreInt64(&t.headerSeqID, header.SeqId)
+
+	if header.EncryptionMode != acproto.PacketHeader_kEncryptionNone {
+		key := t.sessionKey
+		if header.EncryptionMode == acproto.PacketHeader_kEncryptionServiceToken {
+			key, err = base64.StdEncoding.DecodeString(t.SecurityKey)
+			checkErr(err)
+		}
+		payload = decrypt(payload, key)
+	}
+
+	if len(payload) != int(header.DecodedPayloadLen) {
+		panic(fmt.Errorf("decode(): the length of body/payload is wrong: payload %d header %d", len(payload), header.DecodedPayloadLen))
+	}
+
+	downstream = &acproto.DownstreamPayload{}
+	err = proto.Unmarshal(payload, downstream)
+	checkErr(err)
+
+	return downstream, nil
 }
 
 // 解密数据，解密方式为aes-128-cbc
-func decrypt(byt []byte, key string) []byte {
-	keyBytes, err := base64.StdEncoding.DecodeString(key)
-	checkErr(err)
-	block, err := aes.NewCipher(keyBytes)
+func decrypt(ciphertext []byte, key []byte) []byte {
+	block, err := aes.NewCipher(key)
 	checkErr(err)
 
-	if len(byt) < aes.BlockSize {
-		log.Println("decrypt(): Ciphertext block size is too short!")
+	if len(ciphertext) < aes.BlockSize {
+		log.Println("decrypt(): the length of ciphertext is less than block size")
 		return nil
 	}
 
-	iv := byt[:aes.BlockSize]
-	cipherText := byt[aes.BlockSize:]
+	iv := ciphertext[:aes.BlockSize]
+	cipherText := ciphertext[aes.BlockSize:]
 
 	if len(cipherText)%aes.BlockSize != 0 {
-		panic(fmt.Errorf("decrypt(): cipherText is not a multiple of the block size"))
+		panic(fmt.Errorf("decrypt(): the length of ciphertext is not a multiple of the block size"))
 	}
 
 	mode := cipher.NewCBCDecrypter(block, iv)
@@ -373,6 +380,6 @@ func decrypt(byt []byte, key string) []byte {
 func unpadding(text []byte) []byte {
 	length := len(text)
 	unpadding := int(text[length-1])
-	t := text[:(length - unpadding)]
-	return t
+
+	return text[:(length - unpadding)]
 }
